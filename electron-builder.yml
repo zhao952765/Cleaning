@@ -1,0 +1,57 @@
+appId: com.startupmanager.app
+productName: Windows启动项管理器
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+
+extraMetadata:
+  main: out/main/index.js
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+  icon: build/icon.ico
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 启动项管理器
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  language: 2052 # 中文
+  license: LICENSE.txt
+  include: build/installer.nsh
+
+publish:
+  provider: github
+  owner: your-username
+  repo: startup-manager
+  releaseType: release
+
+# 自动更新配置
+electronUpdater:
+  provider: github
+
+# ASAR 打包
+asar: true
+compression: maximum
+
+# 排除的文件
+extraFiles:
+  - from: docs
+    to: docs
+    filter: ['**/*']
