@@ -1,43 +1,44 @@
 import Winreg from 'winreg'
 import crypto from 'crypto'
 import { StartupItem, StartupType, StartupStatus, SecurityLevel } from '../../shared/types'
+import { parseCommandLine } from '../system/pathParser'
+import { isRegistryNameProtected } from '../system/protectedItems'
 import { fileInfoExtractor } from './fileInfo'
 
 /**
- * 注册表启动项扫描器
- * 扫描 HKCU/HKLM 下 Run、RunOnce、RunServices、Policies、Winlogon 等路径
+ * RegistryScanner - 注册表启动项扫描器
+ *
+ * 扫描完整路径列表：
+ * HKCU + HKLM (Run, RunOnce, RunOnceEx, RunServices, Policies\Explorer\Run)
+ * WOW6432Node (32位兼容)
+ * Winlogon (Shell, Userinit, Taskman, System)
  */
 export class RegistryScanner {
-  // 完整的注册表路径列表（按来源分组注释）
   private static readonly REGISTRY_PATHS: Array<{
-    hive: string
-    key: string
-    name: string
-    isSystem: boolean
-    enabled: boolean
+    hive: string; key: string; name: string; isSystem: boolean; enabled: boolean
   }> = [
-    // ========== HKCU - 当前用户 ==========
+    // ========== HKCU ==========
     { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKCU-Run', isSystem: false, enabled: true },
     { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKCU-RunOnce', isSystem: false, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx', name: 'HKCU-RunOnceEx', isSystem: false, enabled: true },
     { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKCU-RunServices', isSystem: false, enabled: true },
     { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run-', name: 'HKCU-Run-Disabled', isSystem: false, enabled: false },
     { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run', name: 'HKCU-Policies', isSystem: false, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKCU-Winlogon', isSystem: false, enabled: true },
 
-    // ========== HKLM - 所有用户 ==========
+    // ========== HKLM ==========
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKLM-Run', isSystem: true, enabled: true },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKLM-RunOnce', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx', name: 'HKLM-RunOnceEx', isSystem: true, enabled: true },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKLM-RunServices', isSystem: true, enabled: true },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run-', name: 'HKLM-Run-Disabled', isSystem: true, enabled: false },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run', name: 'HKLM-Policies', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKLM-Winlogon', isSystem: true, enabled: true },
 
-    // ========== HKLM Wow6432Node - 32 位兼容 ==========
+    // ========== WOW6432Node ==========
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKLM-WOW64-Run', isSystem: true, enabled: true },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKLM-WOW64-RunOnce', isSystem: true, enabled: true },
     { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKLM-WOW64-RunServices', isSystem: true, enabled: true },
-
-    // ========== Winlogon - 系统登录相关 ==========
-    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKLM-Winlogon', isSystem: true, enabled: true },
-    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKCU-Winlogon', isSystem: false, enabled: true },
   ]
 
   async scan(): Promise<StartupItem[]> {
@@ -48,8 +49,19 @@ export class RegistryScanner {
       const results = await Promise.all(promises)
       results.forEach(r => items.push(...r))
 
-      // 异步填充 fileInfo（不阻塞主扫描流程）
-      this.enrichWithFileInfo(items)
+      // 异步填充 fileInfo
+      for (const item of items) {
+        if (item.path) {
+          fileInfoExtractor.getFileInfo(item.path).then(info => {
+            if (info) {
+              item.fileInfo = info
+              if (info.version) item.version = info.version
+              if (info.company) item.publisher = info.company
+              if (info.description) item.description = info.description
+            }
+          }).catch(() => {})
+        }
+      }
 
       console.log(`[RegistryScanner] 扫描完成，共 ${items.length} 个注册表启动项`)
     } catch (error) {
@@ -59,7 +71,7 @@ export class RegistryScanner {
     return items
   }
 
-  private async scanRegistryPath(regPath: {
+  private scanRegistryPath(regPath: {
     hive: string; key: string; name: string; isSystem: boolean; enabled: boolean
   }): Promise<StartupItem[]> {
     const items: StartupItem[] = []
@@ -81,7 +93,7 @@ export class RegistryScanner {
               // 跳过 PowerShell 内部属性
               if (['PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider'].includes(value.name)) continue
 
-              // Winlogon 只保留 Shell / Userinit / Taskman / System
+              // Winlogon 只保留指定值
               if (regPath.key.includes('Winlogon')) {
                 if (!['Shell', 'Userinit', 'Taskman', 'System'].includes(value.name)) continue
               }
@@ -101,20 +113,18 @@ export class RegistryScanner {
     })
   }
 
-  /**
-   * 解析注册表值 → StartupItem
-   * 正确处理带引号路径、空格、参数
-   * 例如 "C:\Program Files\xx.exe" -silent → path="C:\Program Files\xx.exe", args="-silent"
-   */
   private parseRegistryValue(
     value: Winreg.RegistryItem,
     regPath: { hive: string; key: string; name: string; isSystem: boolean; enabled: boolean }
   ): StartupItem | null {
-    const { executablePath, args } = this.parseCommandLine(value.value)
-    if (!executablePath) return null
+    const { executable } = parseCommandLine(value.value)
+    if (!executable) return null
 
     const hiveName = regPath.hive === Winreg.HKLM ? 'HKLM' : 'HKCU'
     const location = `${hiveName}${regPath.key}\\${value.name}`
+
+    // 检查保护列表（Winlogon 项）
+    const protectedCheck = isRegistryNameProtected(value.name)
 
     return {
       id: `registry_${this.hashString(location)}`,
@@ -123,73 +133,18 @@ export class RegistryScanner {
       type: StartupType.Registry,
       source: 'registry',
       status: regPath.enabled ? StartupStatus.Enabled : StartupStatus.Disabled,
-      path: executablePath,
-      arguments: args || undefined,
+      path: executable,
+      arguments: undefined,
       publisher: undefined,
       version: undefined,
       securityLevel: SecurityLevel.Safe,
-      impact: 'medium',
+      impact: protectedCheck.protected ? 'high' : 'medium',
       enabled: regPath.enabled,
       location,
-      isSystem: regPath.isSystem,
-      hash: executablePath ? this.hashString(executablePath.toLowerCase()) : undefined,
-      lastModified: undefined,
-    }
-  }
-
-  /**
-   * 解析命令行字符串，正确处理三种情况：
-   * 1. "C:\Program Files\xx.exe" -silent
-   * 2. C:\tools\xx.exe --flag
-   * 3. C:\simple.exe
-   */
-  private parseCommandLine(commandLine: string): { executablePath: string; args: string } {
-    const trimmed = commandLine.trim()
-    if (!trimmed) return { executablePath: '', args: '' }
-
-    // 情况1：被引号包裹
-    if (trimmed.startsWith('"')) {
-      const end = trimmed.indexOf('"', 1)
-      if (end !== -1) {
-        return {
-          executablePath: trimmed.substring(1, end),
-          args: trimmed.substring(end + 1).trim(),
-        }
-      }
-    }
-
-    // 情况2：未被引号包裹，查找第一个空格分割路径和参数
-    const spaceIdx = trimmed.indexOf(' ')
-    if (spaceIdx !== -1) {
-      // 检查第一个空格前是否为有效路径扩展名
-      const potentialPath = trimmed.substring(0, spaceIdx)
-      if (/\.(exe|com|bat|cmd|vbs|ps1|js|dll)$/i.test(potentialPath)) {
-        return {
-          executablePath: potentialPath,
-          args: trimmed.substring(spaceIdx + 1).trim(),
-        }
-      }
-    }
-
-    // 情况3：整个字符串就是路径
-    return { executablePath: trimmed, args: '' }
-  }
-
-  /**
-   * 异步填充 fileInfo（不阻塞扫描）
-   */
-  private enrichWithFileInfo(items: StartupItem[]): void {
-    for (const item of items) {
-      if (item.path) {
-        fileInfoExtractor.getFileInfo(item.path).then(info => {
-          if (info) {
-            item.fileInfo = info
-            if (info.version) item.version = info.version
-            if (info.company) item.publisher = info.company
-            if (info.description) item.description = info.description
-          }
-        }).catch(() => { /* 静默失败 */ })
-      }
+      isSystem: regPath.isSystem || protectedCheck.protected,
+      isProtected: protectedCheck.protected,
+      protectedReason: protectedCheck.reason,
+      hash: executable ? this.hashString(executable.toLowerCase()) : undefined,
     }
   }
 

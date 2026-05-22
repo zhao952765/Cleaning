@@ -1,68 +1,71 @@
-/**
- * 启动项相关类型定义
- */
-
 // 启动项来源类型
 export type StartupSource = 'registry' | 'task' | 'service' | 'folder' | 'plugin' | 'driver' | 'shell'
 
-// 启动项类型（向后兼容）
+// 启动项类型
 export enum StartupType {
-  Registry = 'registry',           // 注册表启动项
-  Service = 'service',             // Windows 服务
-  ScheduledTask = 'scheduledTask', // 计划任务
-  Folder = 'folder',               // 启动文件夹
-  Driver = 'driver',               // 系统驱动
-  Shell = 'shell',                 // Shell 扩展
-  Plugin = 'plugin'                // 插件/扩展
+  Registry = 'registry',
+  Service = 'service',
+  ScheduledTask = 'scheduledTask',
+  Folder = 'folder',
+  Driver = 'driver',
+  Shell = 'shell',
+  Plugin = 'plugin'
 }
 
 // 启动项状态
 export enum StartupStatus {
-  Enabled = 'enabled',     // 已启用
-  Disabled = 'disabled',   // 已禁用
-  Unknown = 'unknown'      // 未知
+  Enabled = 'enabled',
+  Disabled = 'disabled',
+  Unknown = 'unknown'
 }
 
 // 安全等级
 export enum SecurityLevel {
-  Safe = 'safe',           // 安全
-  Caution = 'caution',     // 需谨慎
-  Dangerous = 'dangerous'  // 危险
+  Safe = 'safe',
+  Caution = 'caution',
+  Dangerous = 'dangerous'
 }
 
-// 启动项接口
+// 风险等级
+export type RiskLevel = 'Low' | 'Medium' | 'High' | 'Critical' | 'Unknown'
+
+// 启动项接口（增强版）
 export interface StartupItem {
-  id: string                    // 唯一标识
-  name: string                  // 名称
-  description?: string          // 描述
-  type: StartupType | string    // 类型（支持字符串以兼容自定义类型）
-  source: string                // 来源
-  status: string                // 状态
-  path: string                  // 可执行文件路径
-  arguments?: string            // 启动参数
-  publisher?: string            // 发布者
-  version?: string              // 版本
-  securityLevel: string         // 安全等级
-  impact: string                // 对系统性能的影响
-  enabled: boolean              // 是否启用（便于操作）
-  isSystem?: boolean            // 是否为系统关键项
-  lastModified?: Date           // 最后修改时间
-  icon?: string                 // 图标名称（Font Awesome）
-  iconColor?: string            // 图标颜色
-  banRateValue?: number         // 禁止率数值（0-100）
-  location?: string             // 位置信息（注册表位置或文件路径）
-  hash?: string                 // 文件路径的 MD5 哈希，用于去重和缓存
-  fileInfo?: FileInfo           // 完整的文件元数据信息（可选，通过 FileInfoExtractor 获取）
+  id: string
+  name: string
+  description?: string
+  type: StartupType | string
+  source: string
+  status: string
+  path: string
+  arguments?: string
+  publisher?: string
+  version?: string
+  securityLevel: string
+  impact: string
+  enabled: boolean
+  isSystem?: boolean
+  isProtected?: boolean           // 是否为受保护项（不可禁用）
+  protectedReason?: string        // 保护原因说明
+  triggerSummary?: string         // 计划任务触发器摘要（如"每日10:00触发"）
+  riskLevel?: RiskLevel           // AI 风险评估等级
+  lastModified?: Date
+  icon?: string
+  iconColor?: string
+  banRateValue?: number
+  location?: string
+  hash?: string
+  fileInfo?: FileInfo
 }
 
-// 文件信息接口（步骤 4）
+// 文件信息接口
 export interface FileInfo {
   filePath: string
   fileSize: number
   version: string
   description: string
   company: string
-  icon?: string           // base64 图标（可选）
+  icon?: string
   signature: SignatureInfo
   md5: string
   sha256: string
@@ -72,7 +75,7 @@ export interface FileInfo {
 
 // 签名信息
 export interface SignatureInfo {
-  status: 'valid' | 'invalid' | 'unsigned'  // 有效/无效/无签名
+  status: 'valid' | 'invalid' | 'unsigned'
   signerName?: string
   issuerName?: string
   signedAt?: Date
@@ -84,8 +87,8 @@ export interface ScanOptions {
   scanServices?: boolean
   scanScheduledTasks?: boolean
   scanStartupFolder?: boolean
-  scanDrivers?: boolean        // 驱动程序扫描（可选）
-  scanShellExtensions?: boolean // Shell 扩展扫描（可选）
+  scanDrivers?: boolean
+  scanShellExtensions?: boolean
   scanPlugins?: boolean
 }
 
@@ -95,7 +98,7 @@ export interface ScanResult {
   totalCount: number
   enabledCount: number
   disabledCount: number
-  scanDuration: number  // 扫描耗时（毫秒）
+  scanDuration: number
 }
 
 // AI 分析请求
@@ -114,10 +117,10 @@ export interface AIAnalysisResult {
 // AI 推荐
 export interface AIRecommendation {
   itemId: string
-  action: 'keep' | 'disable' | 'enable'  // 建议操作
-  reason: string                          // 推荐理由
-  confidence: number                      // 置信度 (0-1)
-  priority: 'high' | 'medium' | 'low'    // 优先级
+  action: 'keep' | 'disable' | 'enable'
+  reason: string
+  confidence: number
+  priority: 'high' | 'medium' | 'low'
 }
 
 // 系统信息
@@ -129,7 +132,7 @@ export interface SystemInfo {
   uptime: number
 }
 
-// 优化操作
+// 优化操作/结果
 export interface OptimizationAction {
   itemId: string
   action: 'disable' | 'enable'
@@ -137,9 +140,15 @@ export interface OptimizationAction {
   error?: string
 }
 
-// 优化结果
 export interface OptimizationResult {
   actions: OptimizationAction[]
   successCount: number
   failedCount: number
+}
+
+// 操作结果（统一格式）
+export interface OperationResult {
+  success: boolean
+  message: string
+  backupPath?: string
 }

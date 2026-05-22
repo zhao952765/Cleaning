@@ -1,21 +1,25 @@
 import { aiClient } from './client'
-import { promptBuilder, STARTUP_ANALYSIS_SYSTEM_PROMPT, BATCH_ANALYSIS_SYSTEM_PROMPT } from './prompts'
+import { promptBuilder } from './prompts'
 import { aiConfigManager } from './config'
-import { EnhancedAnalysisResult, BatchAnalysisItem, BatchAnalysisResult, AnalyzeProgress } from './types'
+import { AnalyzeProgress, BatchAnalysisItem, BatchAnalysisResult } from './types'
 import { StartupItem } from '../../shared/types'
 
-const BATCH_SIZE = 10  // 每批最多 10 个
+const BATCH_SIZE = 6  // 每批最多 6 项
+const MAX_RETRIES = 2
+const BATCH_DELAY_MS = 1500
 
 /**
- * 启动项 AI 分析服务
- * 提供智能分批、重试、超时控制、进度回调
+ * AIService - 启动项 AI 分析服务
+ *
+ * 功能：
+ * - 每批最多 6 项分析（避免 token 超限）
+ * - 失败自动重试 2 次（指数退避）
+ * - isProtected:true 的项强制返回"不建议禁用"
+ * - 进度回调
  */
 export class AIService {
   private onProgress?: (progress: AnalyzeProgress) => void
 
-  /**
-   * 设置进度回调
-   */
   setProgressCallback(callback: (progress: AnalyzeProgress) => void): void {
     this.onProgress = callback
   }
@@ -23,232 +27,185 @@ export class AIService {
   /**
    * 分析单个启动项
    */
-  async analyzeSingle(item: StartupItem): Promise<EnhancedAnalysisResult | null> {
-    const config = aiConfigManager.getConfig()
-    if (!config || !config.apiKey) {
-      throw new Error('请先配置 AI API')
+  async analyzeSingle(item: StartupItem): Promise<any | null> {
+    // 受保护项直接返回
+    if (item.isProtected) {
+      return {
+        item_name: item.name,
+        risk_level: 'Low',
+        can_disable: false,
+        disable_warning: item.protectedReason || '系统关键项，不建议禁用',
+        reason: `${item.name} 是受保护的系统关键项，${item.protectedReason || '禁用可能导致系统不稳定'}`,
+        suggestion: '保留此启动项，不要禁用',
+        risk_score: 10,
+      }
     }
 
+    const config = aiConfigManager.getConfig()
+    if (!config || !config.apiKey) throw new Error('请先配置 AI API')
+
     aiClient.initialize(config)
+    this.emitProgress(0, 1, `分析: ${item.name}`)
 
-    this.emitProgress(0, 1, `正在分析: ${item.name}`)
-
-    const systemPrompt = promptBuilder.getSingleAnalysisSystemPrompt()
+    const systemPrompt = this.buildSystemPrompt()
     const userContent = this.buildSingleItemContent(item)
 
-    const maxRetries = 2
-    let lastError: any = null
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        if (attempt > 0) {
-          console.log(`[AIService] 重试第 ${attempt} 次: ${item.name}`)
-          await new Promise(r => setTimeout(r, 2000 * attempt))
-        }
+        if (attempt > 0) await new Promise(r => setTimeout(r, 2000 * attempt))
+        const response = await aiClient.chat(userContent, { systemPrompt, history: [] })
+        if (!response.answer) throw new Error('空响应')
 
-        const response = await aiClient.chat(userContent, {
-          systemPrompt,
-          history: []
-        })
-
-        if (!response.answer) {
-          throw new Error('AI 返回空响应')
-        }
-
-        // 尝试解析 JSON
         const result = this.parseJsonResponse(response.answer)
         if (result) {
-          // 确保 item_name 不为空
           if (!result.item_name) result.item_name = item.name
           this.emitProgress(1, 1, `${item.name} 分析完成`)
           return result
         }
-
-        throw new Error('无法解析 AI 返回的 JSON')
+        throw new Error('JSON 解析失败')
       } catch (error: any) {
-        lastError = error
-        console.warn(`[AIService] 分析失败 (尝试 ${attempt + 1}/${maxRetries + 1}):`, error.message)
-
-        // 超时不重试
         if (error.message?.includes('timeout') || error.code === 'ETIMEDOUT') break
+        if (attempt === MAX_RETRIES) console.error(`[AIService] ${item.name} 失败:`, error.message)
       }
     }
-
-    console.error(`[AIService] ${item.name} 分析最终失败:`, lastError?.message)
     this.emitProgress(1, 1, `${item.name} 分析失败`)
     return null
   }
 
   /**
-   * 批量分析启动项（智能分批，每批 8-10 个，共享上下文节省 token）
-   * @param items 启动项列表
-   * @param onItemComplete 每项完成回调（用于前段逐项显示）
+   * 批量分析（每批最多 BATCH_SIZE 项）
    */
   async analyzeBatch(
     items: StartupItem[],
     onItemComplete?: (result: BatchAnalysisItem) => void
   ): Promise<BatchAnalysisResult> {
     const config = aiConfigManager.getConfig()
-    if (!config || !config.apiKey) {
-      throw new Error('请先配置 AI API')
-    }
+    if (!config || !config.apiKey) throw new Error('请先配置 AI API')
 
     aiClient.initialize(config)
-
     const allResults: BatchAnalysisItem[] = []
-    const totalItems = items.length
-    let completedCount = 0
+    const total = items.length
+    let completed = 0
 
-    this.emitProgress(0, totalItems, `准备分析 ${totalItems} 个启动项...`)
+    this.emitProgress(0, total, `准备分析 ${total} 项...`)
 
-    // 智能分批：每批 BATCH_SIZE 个
     for (let i = 0; i < items.length; i += BATCH_SIZE) {
       const batch = items.slice(i, i + BATCH_SIZE)
       const batchNum = Math.floor(i / BATCH_SIZE) + 1
       const totalBatches = Math.ceil(items.length / BATCH_SIZE)
 
-      this.emitProgress(
-        completedCount, totalItems,
-        `正在分析第 ${batchNum}/${totalBatches} 批 (${batch.length} 项)...`
-      )
+      this.emitProgress(completed, total, `分析第 ${batchNum}/${totalBatches} 批...`)
 
-      const batchResults = await this.analyzeBatchGroup(batch)
+      // 对受保护项直接返回结果，不调用 API
+      const normalItems = batch.filter(it => !it.isProtected)
 
-      for (const result of batchResults) {
-        completedCount++
-        if (result) {
+      // 受保护项直接标记
+      for (const it of batch) {
+        if (it.isProtected) {
+          const result: BatchAnalysisItem = {
+            itemId: it.id, name: it.name,
+            riskLevel: 'low' as 'low' | 'medium' | 'high' | 'critical', canDisable: false,
+            disableWarning: it.protectedReason || '系统关键项',
+            reason: `${it.name} 是系统关键项，受保护不可禁用`,
+            suggestion: '建议保留此启动项',
+            riskScore: 10,
+          }
           allResults.push(result)
           onItemComplete?.(result)
+          completed++
         }
-        this.emitProgress(completedCount, totalItems, `已完成 ${completedCount}/${totalItems}`)
       }
 
-      // 批次间延迟 1s 避免限流
-      if (i + BATCH_SIZE < items.length) {
-        await new Promise(r => setTimeout(r, 1000))
+      // 正常项调用 AI 分析
+      if (normalItems.length > 0) {
+        const batchResults = await this.analyzeBatchGroup(normalItems)
+        for (const result of batchResults) {
+          completed++
+          if (result) {
+            allResults.push(result)
+            onItemComplete?.(result)
+          }
+          this.emitProgress(completed, total, `已完成 ${completed}/${total}`)
+        }
       }
+
+      // 批次间延迟
+      if (i + BATCH_SIZE < items.length) await new Promise(r => setTimeout(r, BATCH_DELAY_MS))
     }
 
-    // 统计摘要
     const optimizable = allResults.filter(r => r.canDisable && r.riskLevel === 'low').length
     const highRisk = allResults.filter(r => r.riskLevel === 'high' || r.riskLevel === 'critical').length
 
-    this.emitProgress(totalItems, totalItems, '分析完成')
-
+    this.emitProgress(total, total, '分析完成')
     return {
       items: allResults,
-      summary: `分析完成：共 ${totalItems} 项，可优化 ${optimizable} 项，高风险 ${highRisk} 项`,
-      totalOptimizable: optimizable
+      summary: `分析完成：${total} 项，可优化 ${optimizable} 项，高风险 ${highRisk} 项`,
+      totalOptimizable: optimizable,
     }
   }
 
-  /**
-   * 分析一批启动项（10 个以内）
-   */
   private async analyzeBatchGroup(batch: StartupItem[]): Promise<(BatchAnalysisItem | null)[]> {
-    const maxRetries = 2
-
-    // 构建批量分析内容
     const { systemPrompt, userContent } = promptBuilder.buildBatchAnalysisPrompt(
-      batch.map(item => ({
-        id: item.id,
-        name: item.name,
-        path: item.path,
-        description: item.description,
-        publisher: item.publisher,
-        source: item.source,
-        enabled: item.enabled
+      batch.map(it => ({
+        id: it.id, name: it.name, path: it.path,
+        description: it.description, publisher: it.publisher,
+        source: it.source, enabled: it.enabled,
       }))
     )
 
-    let lastError: any = null
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        if (attempt > 0) {
-          console.log(`[AIService] 批量分析重试第 ${attempt} 次`)
-          await new Promise(r => setTimeout(r, 3000 * attempt))
-        }
-
-        const response = await aiClient.chat(userContent, {
-          systemPrompt,
-          history: []
-        })
-
-        if (!response.answer) {
-          throw new Error('AI 返回空响应')
-        }
+        if (attempt > 0) await new Promise(r => setTimeout(r, 3000 * attempt))
+        const response = await aiClient.chat(userContent, { systemPrompt, history: [] })
+        if (!response.answer) throw new Error('空响应')
 
         const parsed = this.parseJsonResponse(response.answer)
-        if (!parsed || !parsed.items || !Array.isArray(parsed.items)) {
-          throw new Error('JSON 格式错误：缺少 items 数组')
-        }
-
-        // 确保返回项数量与 batch 一致
-        if (parsed.items.length !== batch.length) {
-          console.warn(`[AIService] 返回项数 (${parsed.items.length}) 与请求 (${batch.length}) 不匹配`)
-        }
-
-        return parsed.items
+        if (parsed?.items && Array.isArray(parsed.items)) return parsed.items
+        throw new Error('JSON 格式错误')
       } catch (error: any) {
-        lastError = error
-        console.warn(`[AIService] 批量分析失败 (${attempt + 1}/${maxRetries + 1}):`, error.message)
-
         if (error.message?.includes('timeout') || error.code === 'ETIMEDOUT') break
       }
     }
-
-    console.error('[AIService] 批量分析最终失败:', lastError?.message)
-    // 返回空结果
     return batch.map(() => null)
   }
 
-  private buildSingleItemContent(item: StartupItem): string {
-    return `请分析以下 Windows 启动项：
-名称: ${item.name}
-路径: ${item.path || '未知'}
-描述: ${item.description || '无'}
-发布者: ${item.publisher || '未知'}
-来源类型: ${item.source}
-当前状态: ${item.enabled ? '已启用' : '已禁用'}
-${item.fileInfo ? `文件版本: ${item.fileInfo.version || '未知'}
-文件大小: ${item.fileInfo.fileSize || '未知'} bytes
-数字签名: ${item.fileInfo.signature?.status || '未知'}` : ''}`
+  /**
+   * 改进的 System Prompt - 分析启动项
+   */
+  private buildSystemPrompt(): string {
+    return `你是一位 Windows 系统启动项分析专家。分析以下启动项并输出 JSON。
+
+评估维度：
+1. risk_level: "Low" | "Medium" | "High" | "Critical"
+2. can_disable: true/false（是否可安全禁用）
+3. disable_warning: 如果 can_disable=false，写明原因
+4. reason: 用中文说明分析理由，识别出常见软件（微信、QQ、NVIDIA、Steam、Adobe、百度网盘等）直接说名称和功能
+5. suggestion: 明确的操作建议（中文）
+6. risk_score: 0-100（越高越危险）
+
+输出严格的 JSON 格式：
+{"item_name":"...","risk_level":"Low|Medium|High|Critical","can_disable":true/false,"disable_warning":"...或null","reason":"...","suggestion":"...","risk_score":0-100}`
   }
 
-  /**
-   * 从 AI 回复中提取 JSON（处理可能的 Markdown 包裹）
-   */
+  private buildSingleItemContent(item: StartupItem): string {
+    return `分析: ${item.name}
+路径: ${item.path || '未知'}
+描述: ${item.description || '无'}
+来源: ${item.source}
+${item.fileInfo ? `发布者: ${item.fileInfo.company || '未知'}\n版本: ${item.fileInfo.version || '未知'}\n数字签名: ${item.fileInfo.signature?.status || '未知'}` : ''}`
+  }
+
   private parseJsonResponse(text: string): any {
-    // 尝试直接解析
-    try {
-      return JSON.parse(text)
-    } catch {
-      // 尝试提取 ```json ... ``` 中的内容
-      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
-      if (jsonMatch) {
-        try {
-          return JSON.parse(jsonMatch[1].trim())
-        } catch {}
-      }
-      // 尝试提取 {...} 或 [{...}]
-      const braceMatch = text.match(/\{[\s\S]*\}/)
-      if (braceMatch) {
-        try {
-          return JSON.parse(braceMatch[0])
-        } catch {}
-      }
-    }
+    try { return JSON.parse(text) } catch {}
+    const m = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+    if (m) try { return JSON.parse(m[1].trim()) } catch {}
+    const b = text.match(/\{[\s\S]*\}/)
+    if (b) try { return JSON.parse(b[0]) } catch {}
     return null
   }
 
   private emitProgress(current: number, total: number, message: string): void {
-    this.onProgress?.({
-      current,
-      total,
-      message,
-      percentage: total > 0 ? Math.round((current / total) * 100) : 0
-    })
+    this.onProgress?.({ current, total, message, percentage: total > 0 ? Math.round((current / total) * 100) : 0 })
   }
 }
 

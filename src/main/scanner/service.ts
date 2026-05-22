@@ -2,15 +2,19 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import crypto from 'crypto'
 import { StartupItem, StartupType, StartupStatus, SecurityLevel } from '../../shared/types'
+import { parseServicePath } from '../system/pathParser'
+import { isServiceProtected, isCriticalByPattern } from '../system/protectedItems'
 import { fileInfoExtractor } from './fileInfo'
 
 const execAsync = promisify(exec)
 
 /**
- * 系统服务扫描器
- * 优先使用 PowerShell Get-CimInstance Win32_Service
- * 回退方案使用 sc query
- * 正确处理 svchost.exe -k netsvcs 等情况
+ * ServiceScanner - 系统服务扫描器
+ *
+ * 主查询: Get-CimInstance -ClassName Win32_Service
+ * 只扫描 StartMode === 'Auto' 的服务
+ * 内置 20+ 关键服务保护列表
+ * svchost.exe 路径从注册表读取真实路径
  */
 export class ServiceScanner {
   async scan(): Promise<StartupItem[]> {
@@ -19,13 +23,11 @@ export class ServiceScanner {
     try {
       const services = await this.getServicesWithPowerShell()
       for (const svc of services) {
+        if (!this.shouldInclude(svc)) continue
         items.push(this.createServiceItem(svc))
       }
-
-      // 异步填充 fileInfo
       this.enrichWithFileInfo(items)
-
-      console.log(`[ServiceScanner] 扫描完成，共 ${items.length} 个服务`)
+      console.log(`[ServiceScanner] 扫描完成，共 ${items.length} 个自动启动服务`)
     } catch (error) {
       console.error('[ServiceScanner] 扫描失败:', error)
     }
@@ -33,10 +35,18 @@ export class ServiceScanner {
     return items
   }
 
+  /**
+   * 只包含 StartMode === 'Auto' 的服务
+   */
+  private shouldInclude(svc: any): boolean {
+    const startMode = (svc.StartMode || '').toLowerCase()
+    return startMode === 'auto'
+  }
+
   private async getServicesWithPowerShell(): Promise<any[]> {
     try {
       const psScript = `
-        $services = Get-CimInstance Win32_Service;
+        $services = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue;
         $result = @();
         foreach ($svc in $services) {
           $result += [PSCustomObject]@{
@@ -54,12 +64,10 @@ export class ServiceScanner {
         ConvertTo-Json $result -Depth 3 -Compress
       `
 
-      const { stdout } = await execAsync(`powershell -NoProfile -Command "${psScript}"`, {
-        encoding: 'utf8',
-        maxBuffer: 20 * 1024 * 1024,
-        timeout: 30000,
-        windowsHide: true,
-      })
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "${psScript}"`,
+        { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, timeout: 30000, windowsHide: true }
+      )
 
       if (!stdout || stdout.trim().length === 0) return []
 
@@ -72,30 +80,19 @@ export class ServiceScanner {
   }
 
   /**
-   * 回退方案：使用 sc query 命令
+   * 回退方案：sc query
    */
   private async getServicesWithSc(): Promise<any[]> {
-    const allServices: any[] = []
     try {
-      // sc query 分页获取所有服务
-      let lastBuffer = ''
-      while (true) {
-        const { stdout } = await execAsync(
-          `sc queryex type= service state= all${lastBuffer ? ` bufsize= 5000` : ''}`,
-          { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 15000 }
-        )
-        const parsed = this.parseScOutput(stdout)
-        allServices.push(...parsed)
-
-        // 检查是否有更多页
-        const resumeMatch = stdout.match(/RESUME_TOKEN\s*:\s*(\d+)/)
-        if (!resumeMatch || resumeMatch[1] === '0') break
-        lastBuffer = ` resume= ${resumeMatch[1]}`
-      }
+      const { stdout } = await execAsync(
+        'sc queryex type= service state= all',
+        { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 15000 }
+      )
+      return this.parseScOutput(stdout)
     } catch (error) {
       console.error('[ServiceScanner] sc query 失败:', error)
+      return []
     }
-    return allServices
   }
 
   private parseScOutput(output: string): any[] {
@@ -127,65 +124,41 @@ export class ServiceScanner {
 
   private createServiceItem(service: any): StartupItem {
     const displayName = service.DisplayName || service.Name || 'Unknown Service'
-    const startMode = (service.StartMode || '').toLowerCase()
     const state = (service.State || '').toLowerCase()
+    const serviceName = service.Name || ''
+    const isEnabled = state === 'running'
 
-    const isEnabled = state === 'running' || ['auto', 'boot', 'system'].includes(startMode)
-    const isSystemService = ['boot', 'system'].includes(startMode) ||
-      (service.ServiceType && typeof service.ServiceType === 'string' &&
-       (service.ServiceType.includes('Kernel') || service.ServiceType.includes('File System')))
+    // 检查保护列表
+    const protectedCheck = isServiceProtected(serviceName) || isCriticalByPattern(displayName, service.PathName || '')
 
-    // 解析服务可执行文件路径
-    // 特殊处理 svchost.exe -k netsvcs → 提取真实服务名称
-    const binaryPath = service.PathName || ''
-    const { executablePath, args } = this.parseServicePath(binaryPath)
-
-    // 对于 svchost 等共享进程，用服务名作为路径补充
-    let finalPath = executablePath
-    if (!finalPath || finalPath.toLowerCase().includes('svchost.exe')) {
-      finalPath = `C:\\Windows\\System32\\svchost.exe -k ${service.Name}`
-    }
+    // 解析路径（含 svchost 特殊处理）
+    const { executable, description } = parseServicePath(service.PathName || '', serviceName)
 
     return {
-      id: `service_${this.hashString(service.Name)}`,
+      id: `service_${this.hashString(serviceName)}`,
       name: displayName,
-      description: service.Description || undefined,
+      description: service.Description || description || undefined,
       type: StartupType.Service,
       source: 'service',
       status: isEnabled ? StartupStatus.Enabled : StartupStatus.Disabled,
-      path: finalPath,
-      arguments: args || undefined,
+      path: executable || serviceName,
+      arguments: undefined,
       publisher: service.StartName || undefined,
       version: undefined,
       securityLevel: SecurityLevel.Safe,
-      impact: isSystemService ? 'high' : 'medium',
+      impact: protectedCheck.protected ? 'high' : 'medium',
       enabled: isEnabled,
-      isSystem: isSystemService,
-      hash: finalPath ? this.hashString(finalPath.toLowerCase()) : undefined,
+      isSystem: protectedCheck.protected,
+      isProtected: protectedCheck.protected,
+      protectedReason: protectedCheck.reason,
+      location: service.PathName || undefined,
+      hash: executable ? this.hashString(executable.toLowerCase()) : undefined,
     }
-  }
-
-  private parseServicePath(binaryPath: string): { executablePath: string; args: string } {
-    const trimmed = binaryPath.trim()
-    if (!trimmed) return { executablePath: '', args: '' }
-
-    if (trimmed.startsWith('"')) {
-      const end = trimmed.indexOf('"', 1)
-      if (end !== -1) return { executablePath: trimmed.substring(1, end), args: trimmed.substring(end + 1).trim() }
-    }
-
-    const spaceIdx = trimmed.indexOf(' ')
-    if (spaceIdx !== -1) return { executablePath: trimmed.substring(0, spaceIdx), args: trimmed.substring(spaceIdx + 1).trim() }
-
-    return { executablePath: trimmed, args: '' }
   }
 
   private enrichWithFileInfo(items: StartupItem[]): void {
     for (const item of items) {
-      // 只对真实文件路径尝试获取 fileInfo
-      const realPath = item.path && !item.path.includes('svchost.exe')
-        ? item.path.split(' -k ')[0]
-        : null
+      const realPath = item.path && !item.path.includes('svchost.exe') ? item.path : null
       if (realPath) {
         fileInfoExtractor.getFileInfo(realPath).then(info => {
           if (info) {

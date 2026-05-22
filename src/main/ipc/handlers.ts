@@ -498,26 +498,6 @@ export class IPCHandlers {
       }
     })
 
-    // 切换启动项状态（实际执行）
-    ipcMain.handle(IPC_CHANNELS.ITEM.TOGGLE, async (_event, item: StartupItem, enabled: boolean) => {
-      try {
-        // 检查是否为系统关键项
-        const { systemOperationsManager } = await import('../system/operations')
-        if (!enabled && systemOperationsManager.isSystemCritical(item)) {
-          return this.error('系统关键项，禁止禁用')
-        }
-
-        await systemOperationsManager.toggleItem(item, enabled)
-        
-        return this.success({
-          message: `已${enabled ? '启用' : '禁用'}: ${item.name}`,
-          item: { ...item, enabled }
-        })
-      } catch (error: any) {
-        return this.error(error.message)
-      }
-    })
-
     // 批量操作
     ipcMain.handle(IPC_CHANNELS.ITEM.BATCH_TOGGLE, async (_event, items: any[], enable: boolean) => {
       try {
