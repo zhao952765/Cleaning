@@ -3,14 +3,16 @@
  */
 
 // 启动项来源类型
-export type StartupSource = 'registry' | 'task' | 'service' | 'folder' | 'plugin'
+export type StartupSource = 'registry' | 'task' | 'service' | 'folder' | 'plugin' | 'driver' | 'shell'
 
 // 启动项类型（向后兼容）
 export enum StartupType {
   Registry = 'registry',           // 注册表启动项
   Service = 'service',             // Windows 服务
-  ScheduledTask = 'scheduled_task', // 计划任务
-  StartupFolder = 'startup_folder', // 启动文件夹
+  ScheduledTask = 'scheduledTask', // 计划任务
+  Folder = 'folder',               // 启动文件夹
+  Driver = 'driver',               // 系统驱动
+  Shell = 'shell',                 // Shell 扩展
   Plugin = 'plugin'                // 插件/扩展
 }
 
@@ -30,23 +32,27 @@ export enum SecurityLevel {
 
 // 启动项接口
 export interface StartupItem {
-  id: string               // 唯一标识
-  name: string             // 名称
-  description?: string     // 描述
-  type: StartupType        // 类型
-  source?: StartupSource   // 来源（新增）
-  status: StartupStatus    // 状态
-  path: string             // 路径
-  arguments?: string       // 启动参数
-  publisher?: string       // 发布者
-  version?: string         // 版本
-  securityLevel: SecurityLevel  // 安全等级
-  impact: string           // 对系统性能的影响
-  enabled: boolean         // 是否启用（便于操作）
-  lastModified?: Date      // 最后修改时间
-  icon?: string            // 图标名称（Font Awesome）
-  iconColor?: string       // 图标颜色（Tailwind 渐变色类）
-  banRateValue?: number    // 禁止率数值（0-100）
+  id: string                    // 唯一标识
+  name: string                  // 名称
+  description?: string          // 描述
+  type: StartupType | string    // 类型（支持字符串以兼容自定义类型）
+  source: string                // 来源
+  status: string                // 状态
+  path: string                  // 可执行文件路径
+  arguments?: string            // 启动参数
+  publisher?: string            // 发布者
+  version?: string              // 版本
+  securityLevel: string         // 安全等级
+  impact: string                // 对系统性能的影响
+  enabled: boolean              // 是否启用（便于操作）
+  isSystem?: boolean            // 是否为系统关键项
+  lastModified?: Date           // 最后修改时间
+  icon?: string                 // 图标名称（Font Awesome）
+  iconColor?: string            // 图标颜色
+  banRateValue?: number         // 禁止率数值（0-100）
+  location?: string             // 位置信息（注册表位置或文件路径）
+  hash?: string                 // 文件路径的 MD5 哈希，用于去重和缓存
+  fileInfo?: FileInfo           // 完整的文件元数据信息（可选，通过 FileInfoExtractor 获取）
 }
 
 // 文件信息接口（步骤 4）
@@ -74,11 +80,13 @@ export interface SignatureInfo {
 
 // 扫描选项
 export interface ScanOptions {
-  scanRegistry: boolean
-  scanServices: boolean
-  scanScheduledTasks: boolean
-  scanStartupFolder: boolean
-  scanPlugins: boolean
+  scanRegistry?: boolean
+  scanServices?: boolean
+  scanScheduledTasks?: boolean
+  scanStartupFolder?: boolean
+  scanDrivers?: boolean        // 驱动程序扫描（可选）
+  scanShellExtensions?: boolean // Shell 扩展扫描（可选）
+  scanPlugins?: boolean
 }
 
 // 扫描结果

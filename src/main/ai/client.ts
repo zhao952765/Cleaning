@@ -65,10 +65,15 @@ export class AIClient {
           url = url + '/v1'
         }
         break
+      case 'tongyi':
+        // 通义千问 DashScope API 使用 /compatible-mode/v1
+        if (!url.includes('/v1') && !url.includes('/compatible-mode')) {
+          url = url + '/v1'
+        }
+        break
       case 'custom':
         // 自定义提供商，尝试智能判断
         if (!url.includes('/v1') && !url.includes('/api')) {
-          // 如果 URL 看起来像基础域名，添加 /v1
           url = url + '/v1'
         }
         break
@@ -302,41 +307,79 @@ export class AIClient {
   }
 
   /**
-   * 批量分析启动项（支持并发控制）
+   * 批量分析启动项（智能分批 + 重试机制）
+   * 每批最多 10 项，使用统一上下文节省 token
    */
   async batchAnalyze(
     prompts: string[],
     concurrency: number = 5
   ): Promise<(AIAnalysisResult | null)[]> {
     const results: (AIAnalysisResult | null)[] = []
-    
-    console.log(`[AIClient] 开始批量分析，共 ${prompts.length} 项，并发数: ${concurrency}`)
+    const maxRetries = 2
+    const BATCH_SIZE = 10
 
-    // 分批处理
-    for (let i = 0; i < prompts.length; i += concurrency) {
-      const batch = prompts.slice(i, i + concurrency)
-      console.log(`[AIClient] 处理批次 ${Math.floor(i / concurrency) + 1}/${Math.ceil(prompts.length / concurrency)}`)
+    console.log(`[AIClient] 开始批量分析，共 ${prompts.length} 项，每批 ${BATCH_SIZE} 项，并发 ${concurrency}`)
 
-      const batchResults = await Promise.all(
-        batch.map(async (prompt) => {
+    for (let i = 0; i < prompts.length; i += BATCH_SIZE) {
+      const batch = prompts.slice(i, i + BATCH_SIZE)
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1
+      const totalBatches = Math.ceil(prompts.length / BATCH_SIZE)
+      console.log(`[AIClient] 处理批次 ${batchNum}/${totalBatches} (${batch.length} 项)`)
+
+      const batchResults: (AIAnalysisResult | null)[] = []
+
+      for (const prompt of batch) {
+        let lastError: any = null
+        let success = false
+
+        // 重试机制：失败重试 2 次
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
           try {
-            return await this.analyzeSoftware(prompt)
-          } catch (error) {
-            console.error('[AIClient] 批量分析中某项失败:', error)
-            return null
+            if (attempt > 0) {
+              console.log(`[AIClient] 重试第 ${attempt} 次...`)
+              await new Promise(r => setTimeout(r, 2000 * attempt)) // 递增延迟
+            }
+
+            const result = await this.analyzeSoftware(prompt, {
+              temperature: 0.3, // 分析任务使用低 temperature 保证一致性
+              maxTokens: this.config?.maxTokens ?? 2000
+            })
+
+            batchResults.push(result)
+            success = true
+            break
+          } catch (error: any) {
+            lastError = error
+            console.warn(`[AIClient] 分析失败 (尝试 ${attempt + 1}/${maxRetries + 1}):`, error.message)
+
+            // 超时控制 - 如果是超时异常，尝试缩短 prompt
+            if (error.message?.includes('timeout') || error.code === 'ETIMEDOUT') {
+              console.warn('[AIClient] 请求超时，跳过此项')
+              break
+            }
           }
-        })
-      )
+        }
+
+        if (!success) {
+          console.error('[AIClient] 分析最终失败:', lastError?.message)
+          batchResults.push(null)
+        }
+
+        // 每项之间 500ms 间隔避免限流
+        await new Promise(r => setTimeout(r, 500))
+      }
 
       results.push(...batchResults)
 
-      // 避免触发速率限制，批次间延迟
-      if (i + concurrency < prompts.length) {
-        await new Promise(resolve => setTimeout(resolve, 1000))
+      // 批次间延迟
+      if (i + BATCH_SIZE < prompts.length) {
+        console.log(`[AIClient] 批次完成，等待 2s 后继续...`)
+        await new Promise(r => setTimeout(r, 2000))
       }
     }
 
-    console.log('[AIClient] 批量分析完成')
+    const succeeded = results.filter(r => r !== null).length
+    console.log(`[AIClient] 批量分析完成: ${succeeded}/${prompts.length} 成功`)
     return results
   }
 

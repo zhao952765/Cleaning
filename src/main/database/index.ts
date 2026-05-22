@@ -44,6 +44,16 @@ export interface ScanHistory {
 }
 
 /**
+ * 扫描缓存条目
+ */
+export interface ScanCacheEntry {
+  path: string
+  mtime: number
+  hash: string
+  scannedAt: string
+}
+
+/**
  * JSON 文件数据库管理器（开发环境友好）
  */
 export class DatabaseManager {
@@ -52,10 +62,12 @@ export class DatabaseManager {
     software_cache: Map<string, SoftwareCache>
     user_actions: UserAction[]
     scan_history: ScanHistory[]
+    scan_cache: ScanCacheEntry[]
   } = {
     software_cache: new Map(),
     user_actions: [],
-    scan_history: []
+    scan_history: [],
+    scan_cache: []
   }
 
   constructor() {
@@ -99,6 +111,7 @@ export class DatabaseManager {
         this.data.software_cache = new Map(Object.entries(parsed.software_cache || {}))
         this.data.user_actions = parsed.user_actions || []
         this.data.scan_history = parsed.scan_history || []
+        this.data.scan_cache = parsed.scan_cache || []
 
         console.log('[Database] 数据加载成功')
       } else {
@@ -119,7 +132,8 @@ export class DatabaseManager {
       const serialized = {
         software_cache: Object.fromEntries(this.data.software_cache),
         user_actions: this.data.user_actions,
-        scan_history: this.data.scan_history
+        scan_history: this.data.scan_history,
+        scan_cache: this.data.scan_cache
       }
 
       fs.writeFileSync(this.dbPath, JSON.stringify(serialized, null, 2), 'utf-8')
@@ -288,6 +302,33 @@ export class DatabaseManager {
       userActionsCount: this.data.user_actions.length,
       scanHistoryCount: this.data.scan_history.length
     }
+  }
+
+  // ==================== 扫描缓存操作 ====================
+
+  /**
+   * 保存扫描缓存
+   */
+  saveScanCache(cache: ScanCacheEntry[]): void {
+    this.data.scan_cache = cache
+    this.saveData()
+    console.log(`[Database] 扫描缓存已保存 (${cache.length} 项)`)
+  }
+
+  /**
+   * 获取扫描缓存
+   */
+  getScanCache(): ScanCacheEntry[] {
+    return [...this.data.scan_cache]
+  }
+
+  /**
+   * 清除扫描缓存
+   */
+  clearScanCache(): void {
+    this.data.scan_cache = []
+    this.saveData()
+    console.log('[Database] 扫描缓存已清除')
   }
 }
 

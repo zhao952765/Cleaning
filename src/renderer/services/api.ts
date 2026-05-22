@@ -49,15 +49,13 @@ export class RendererAPI {
   }
 
   /**
-   * 监听扫描进度
+   * 监听扫描进度（增强版，含 stage 字段）
    */
-  static onScanProgress(callback: (progress: ProgressNotification) => void): () => void {
-    const listener = (_event: any, progress: ProgressNotification) => callback(progress)
-    ipcRenderer.on('scan:progress', listener)
-    
-    // 返回取消监听的函数
+  static onScanProgress(callback: (progress: ProgressNotification & { stage?: string }) => void): () => void {
+    const listener = (_event: any, progress: ProgressNotification & { stage?: string }) => callback(progress)
+    ipcRenderer.on(IPC_CHANNELS.SCAN.PROGRESS, listener)
     return () => {
-      ipcRenderer.removeListener('scan:progress', listener)
+      ipcRenderer.removeListener(IPC_CHANNELS.SCAN.PROGRESS, listener)
     }
   }
 
@@ -66,8 +64,29 @@ export class RendererAPI {
   /**
    * 切换启动项状态
    */
-  static async toggleItem(itemId: string, enabled: boolean): Promise<IPCResponse> {
-    return ipcRenderer.invoke(IPC_CHANNELS.ITEM.TOGGLE, itemId, enabled)
+  static async toggleItem(item: any, enabled: boolean): Promise<IPCResponse> {
+    return ipcRenderer.invoke(IPC_CHANNELS.ITEM.TOGGLE, item, enabled)
+  }
+
+  /**
+   * 强制切换（绕过关键项警告）
+   */
+  static async toggleItemForce(item: any, enabled: boolean): Promise<IPCResponse> {
+    return ipcRenderer.invoke('item:toggle-force', item, enabled)
+  }
+
+  /**
+   * 删除启动项
+   */
+  static async deleteItem(item: any): Promise<IPCResponse> {
+    return ipcRenderer.invoke(IPC_CHANNELS.ITEM.DELETE, item)
+  }
+
+  /**
+   * 强制删除（绕过关键项保护）
+   */
+  static async deleteItemForce(item: any): Promise<IPCResponse> {
+    return ipcRenderer.invoke('item:delete-force', item)
   }
 
   /**

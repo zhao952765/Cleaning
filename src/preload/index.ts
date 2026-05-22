@@ -50,32 +50,68 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke(IPC_CHANNELS.SYSTEM.GET_BOOT_TIME),
   
   // 启用/禁用启动项
-  toggleStartupItem: (itemId: string, enabled: boolean) => 
-    ipcRenderer.invoke(IPC_CHANNELS.ITEM.TOGGLE, itemId, enabled),
-  
+  toggleStartupItem: (item: any, enabled: boolean) => 
+    ipcRenderer.invoke(IPC_CHANNELS.ITEM.TOGGLE, item, enabled),
+
+  // 强制切换（绕过关键项警告）
+  toggleStartupItemForce: (item: any, enabled: boolean) => 
+    ipcRenderer.invoke('item:toggle-force', item, enabled),
+
+  // 删除启动项
+  deleteStartupItem: (item: any) => 
+    ipcRenderer.invoke(IPC_CHANNELS.ITEM.DELETE, item),
+
+  // 强制删除（绕过关键项保护）
+  deleteStartupItemForce: (item: any) => 
+    ipcRenderer.invoke('item:delete-force', item),
+
   // 批量操作
   batchToggleItems: (items: any[], enable: boolean) => 
-    ipcRenderer.invoke('item:batch-toggle', items, enable),
-  
+    ipcRenderer.invoke(IPC_CHANNELS.ITEM.BATCH_TOGGLE, items, enable),
+
   // 还原所有修改
   restoreAllItems: () => 
-    ipcRenderer.invoke('item:restore-all'),
-  
+    ipcRenderer.invoke(IPC_CHANNELS.ITEM.RESTORE_ALL),
+
   // 检查是否为系统关键项
   isCriticalItem: (item: any) => 
-    ipcRenderer.invoke('item:is-critical', item),
-  
+    ipcRenderer.invoke(IPC_CHANNELS.ITEM.IS_CRITICAL, item),
+
   // 缓存管理
   clearScanCache: () => 
-    ipcRenderer.invoke('cache:clear-scan'),
+    ipcRenderer.invoke(IPC_CHANNELS.CACHE.CLEAR_SCAN),
   clearAICache: () => 
-    ipcRenderer.invoke('cache:clear-ai'),
+    ipcRenderer.invoke(IPC_CHANNELS.CACHE.CLEAR_AI),
   getCacheStats: () => 
-    ipcRenderer.invoke('cache:get-stats'),
-  
+    ipcRenderer.invoke(IPC_CHANNELS.CACHE.GET_STATS),
+
   // 内存监控
   getMemoryUsage: () => 
-    ipcRenderer.invoke('system:get-memory')
+    ipcRenderer.invoke(IPC_CHANNELS.SYSTEM.GET_MEMORY),
+
+  // AI 分析
+  analyzeSingle: (item: any) => 
+    ipcRenderer.invoke('ai:analyze-single', item),
+  analyzeBatch: (items: any[]) => 
+    ipcRenderer.invoke('ai:analyze-batch', items),
+
+  // 监听扫描进度（增强版：含 stage 字段）
+  onScanProgress: (callback: (progress: any) => void) => {
+    const handler = (_event: any, progress: any) => callback(progress)
+    ipcRenderer.on(IPC_CHANNELS.SCAN.PROGRESS, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.SCAN.PROGRESS, handler)
+  },
+
+  // 以管理员身份重启
+  relaunchAsAdmin: () => 
+    ipcRenderer.invoke(IPC_CHANNELS.SYSTEM.RELAUNCH_AS_ADMIN),
+
+  // 监听管理员权限推送
+  onAdminStatus: (callback: (result: any) => void) => {
+    const handler = (_event: any, result: any) => callback(result)
+    ipcRenderer.on(IPC_CHANNELS.SYSTEM.IS_ADMIN, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.SYSTEM.IS_ADMIN, handler)
+  }
 })
 
 // 类型声明（在渲染进程中可以使用这些类型）
@@ -204,7 +240,29 @@ declare global {
       toggleStartupItem: (itemId: string, enabled: boolean) => Promise<{
         success: boolean
         message?: string
+        data?: any
         warning?: string
+        requireConfirm?: boolean
+        error?: string
+      }>
+      toggleStartupItemForce: (item: any, enabled: boolean) => Promise<{
+        success: boolean
+        message?: string
+        data?: any
+        error?: string
+      }>
+      deleteStartupItem: (item: any) => Promise<{
+        success: boolean
+        message?: string
+        backupPath?: string
+        requireConfirm?: boolean
+        warning?: string
+        error?: string
+      }>
+      deleteStartupItemForce: (item: any) => Promise<{
+        success: boolean
+        message?: string
+        backupPath?: string
         error?: string
       }>
       batchToggleItems: (items: any[], enable: boolean) => Promise<{
@@ -257,6 +315,46 @@ declare global {
         }
         error?: string
       }>
+      analyzeSingle: (item: any) => Promise<{
+        success: boolean
+        data?: {
+          item_name: string
+          risk_level: string
+          can_disable: boolean
+          disable_warning?: string
+          reason: string
+          suggestion: string
+          risk_score: number
+        }
+        error?: string
+      }>
+      analyzeBatch: (items: any[]) => Promise<{
+        success: boolean
+        data?: {
+          items: Array<{
+            itemId: string
+            name: string
+            riskLevel: string
+            canDisable: boolean
+            disableWarning?: string
+            reason: string
+            suggestion: string
+            riskScore: number
+          }>
+          summary: string
+          totalOptimizable: number
+        }
+        error?: string
+      }>
+      onScanProgress: (callback: (progress: {
+        current: number
+        total: number
+        stage?: string
+        message: string
+        percentage: number
+      }) => void) => () => void
+      relaunchAsAdmin: () => Promise<{ success: boolean }>
+      onAdminStatus: (callback: (result: any) => void) => () => void
     }
   }
 }

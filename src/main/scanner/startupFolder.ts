@@ -1,55 +1,59 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import crypto from 'crypto'
+import { exec } from 'child_process'
+import { promisify } from 'util'
 import { StartupItem, StartupType, StartupStatus, SecurityLevel } from '../../shared/types'
+import { fileInfoExtractor } from './fileInfo'
+
+const execAsync = promisify(exec)
 
 /**
- * 启动文件夹扫描器
- * 扫描用户和公共启动文件夹中的快捷方式
+ * 启动文件夹扫描器（增强版）
+ * 扫描两个标准位置：
+ * - %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+ * - C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
+ * 支持 .lnk 快捷方式解析
  */
 export class StartupFolderScanner {
-  // 启动文件夹路径
   private readonly STARTUP_FOLDERS = [
     {
       name: 'User Startup',
-      path: path.join(
-        os.homedir(),
-        'AppData',
-        'Roaming',
-        'Microsoft',
-        'Windows',
-        'Start Menu',
-        'Programs',
-        'Startup'
-      )
+      path: path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'),
     },
     {
       name: 'Common Startup',
-      path: path.join(
-        'C:',
-        'ProgramData',
-        'Microsoft',
-        'Windows',
-        'Start Menu',
-        'Programs',
-        'StartUp'
-      )
-    }
+      path: path.join('C:', 'ProgramData', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'StartUp'),
+    },
   ]
 
-  /**
-   * 扫描启动文件夹
-   */
+  // 支持的文件类型
+  private readonly VALID_EXTENSIONS = ['.exe', '.bat', '.cmd', '.com', '.vbs', '.ps1', '.js', '.lnk']
+
   async scan(): Promise<StartupItem[]> {
     const items: StartupItem[] = []
 
     try {
       for (const folder of this.STARTUP_FOLDERS) {
-        const folderItems = await this.scanFolder(folder)
-        items.push(...folderItems)
+        const enabledItems = await this.scanFolder(folder, true)
+        items.push(...enabledItems)
+
+        // 扫描 Disabled 子文件夹
+        const disabledFolder = path.join(folder.path, 'Disabled')
+        if (fs.existsSync(disabledFolder)) {
+          const disabledItems = await this.scanFolder(
+            { name: folder.name + '-Disabled', path: disabledFolder },
+            false,
+          )
+          items.push(...disabledItems)
+        }
       }
 
-      console.log(`[StartupFolderScanner] 扫描完成，共找到 ${items.length} 个启动文件夹项`)
+      // 异步填充 fileInfo
+      this.enrichWithFileInfo(items)
+
+      console.log(`[StartupFolderScanner] 扫描完成，共 ${items.length} 个启动项`)
     } catch (error) {
       console.error('[StartupFolderScanner] 扫描失败:', error)
     }
@@ -57,35 +61,25 @@ export class StartupFolderScanner {
     return items
   }
 
-  /**
-   * 扫描单个文件夹
-   */
-  private async scanFolder(folderInfo: { name: string; path: string }): Promise<StartupItem[]> {
+  private async scanFolder(folderInfo: { name: string; path: string }, enabled: boolean): Promise<StartupItem[]> {
     const items: StartupItem[] = []
 
     try {
-      // 检查文件夹是否存在
-      if (!fs.existsSync(folderInfo.path)) {
-        console.warn(`[StartupFolderScanner] 文件夹不存在: ${folderInfo.path}`)
-        return []
-      }
+      if (!fs.existsSync(folderInfo.path)) return []
 
-      // 读取文件夹内容
       const files = fs.readdirSync(folderInfo.path)
 
       for (const file of files) {
         const filePath = path.join(folderInfo.path, file)
-        
         try {
           const stat = fs.statSync(filePath)
-          
-          // 只处理文件（不递归子目录）
-          if (stat.isFile()) {
-            const item = this.createStartupItem(file, filePath, folderInfo.name)
-            if (item) {
-              items.push(item)
-            }
-          }
+          if (!stat.isFile()) continue
+
+          const ext = path.extname(file).toLowerCase()
+          if (!this.VALID_EXTENSIONS.includes(ext)) continue
+
+          const item = await this.createStartupItem(file, filePath, folderInfo.name, enabled, stat)
+          if (item) items.push(item)
         } catch (fileError) {
           console.warn(`[StartupFolderScanner] 处理文件失败 [${file}]:`, fileError)
         }
@@ -97,54 +91,51 @@ export class StartupFolderScanner {
     return items
   }
 
-  /**
-   * 创建启动项对象
-   */
-  private createStartupItem(
+  private async createStartupItem(
     fileName: string,
     filePath: string,
-    folderName: string
-  ): StartupItem | null {
+    folderName: string,
+    enabled: boolean,
+    stat: fs.Stats,
+  ): Promise<StartupItem | null> {
     try {
-      // 获取文件信息
-      const stat = fs.statSync(filePath)
-      
-      // 解析文件扩展名
       const ext = path.extname(fileName).toLowerCase()
-      
-      // 只处理可执行文件和快捷方式
-      const validExtensions = ['.exe', '.bat', '.cmd', '.com', '.vbs', '.js', '.lnk']
-      if (!validExtensions.includes(ext)) {
-        return null
-      }
-
       let targetPath = filePath
-      let description = undefined
+      let args = ''
+      let description: string | undefined
 
-      // 如果是快捷方式，尝试解析目标
+      // 解析 .lnk 快捷方式
       if (ext === '.lnk') {
-        targetPath = this.resolveShortcut(filePath) || filePath
-        description = `快捷方式: ${fileName}`
+        const resolved = await this.resolveShortcut(filePath)
+        if (resolved) {
+          targetPath = resolved.executablePath
+          args = resolved.arguments
+          description = `快捷方式: ${fileName}`
+        } else {
+          // 解析失败时回退到原始路径
+          description = `未解析的快捷方式: ${fileName}`
+        }
       }
+
+      const baseName = path.basename(fileName, ext)
 
       return {
-        id: `folder_${this.generateId(filePath)}`,
-        name: path.basename(fileName, ext),
+        id: `folder_${this.hashString(filePath)}`,
+        name: baseName,
         description,
-        type: StartupType.StartupFolder,
+        type: StartupType.Folder,
         source: 'folder',
-        status: StartupStatus.Enabled,
+        status: enabled ? StartupStatus.Enabled : StartupStatus.Disabled,
         path: targetPath,
-        arguments: undefined,
+        arguments: args || undefined,
         publisher: undefined,
         version: undefined,
         securityLevel: SecurityLevel.Safe,
         impact: 'low',
-        enabled: true,
+        enabled,
         lastModified: stat.mtime,
-        icon: undefined,
-        iconColor: undefined,
-        banRateValue: undefined
+        location: filePath,
+        hash: targetPath ? this.hashString(targetPath.toLowerCase()) : undefined,
       }
     } catch (error) {
       console.error(`[StartupFolderScanner] 创建启动项失败 [${fileName}]:`, error)
@@ -153,35 +144,58 @@ export class StartupFolderScanner {
   }
 
   /**
-   * 解析快捷方式（简化版）
-   * 注意：Node.js 原生不支持 .lnk 解析，需要使用第三方库或 PowerShell
+   * 使用 PowerShell 解析 .lnk 快捷方式，提取目标路径和参数
    */
-  private resolveShortcut(lnkPath: string): string | null {
+  private async resolveShortcut(lnkPath: string): Promise<{ executablePath: string; arguments: string } | null> {
     try {
-      // TODO: 使用 PowerShell 或其他方法解析 .lnk 文件
-      // 这里返回原始路径作为占位符
-      return lnkPath
+      const psScript = `
+        $shell = New-Object -ComObject WScript.Shell;
+        $shortcut = $shell.CreateShortcut('${lnkPath.replace(/'/g, "''")}');
+        [PSCustomObject]@{
+          TargetPath = $shortcut.TargetPath
+          Arguments = $shortcut.Arguments
+          WorkingDirectory = $shortcut.WorkingDirectory
+          Description = $shortcut.Description
+        } | ConvertTo-Json -Compress
+      `
+
+      const { stdout } = await execAsync(`powershell -NoProfile -Command "${psScript}"`, {
+        encoding: 'utf8',
+        timeout: 10000,
+        windowsHide: true,
+      })
+
+      if (!stdout || stdout.trim().length === 0) return null
+
+      const result = JSON.parse(stdout)
+      return {
+        executablePath: result.TargetPath || '',
+        arguments: result.Arguments || '',
+      }
     } catch (error) {
-      console.warn(`[StartupFolderScanner] 解析快捷方式失败:`, error)
+      console.warn(`[StartupFolderScanner] 解析快捷方式失败 [${lnkPath}]:`, error)
       return null
     }
   }
 
-  /**
-   * 生成唯一 ID
-   */
-  private generateId(filePath: string): string {
-    let hash = 0
-    for (let i = 0; i < filePath.length; i++) {
-      const char = filePath.charCodeAt(i)
-      hash = ((hash << 5) - hash) + char
-      hash = hash & hash
+  private enrichWithFileInfo(items: StartupItem[]): void {
+    for (const item of items) {
+      if (item.path && fs.existsSync(item.path)) {
+        fileInfoExtractor.getFileInfo(item.path).then(info => {
+          if (info) {
+            item.fileInfo = info
+            if (info.version) item.version = info.version
+            if (info.company) item.publisher = info.company
+            if (info.description && !item.description) item.description = info.description
+          }
+        }).catch(() => {})
+      }
     }
-    return Math.abs(hash).toString(16)
+  }
+
+  private hashString(input: string): string {
+    return crypto.createHash('md5').update(input).digest('hex').substring(0, 16)
   }
 }
 
-/**
- * 导出单例实例
- */
 export const startupFolderScanner = new StartupFolderScanner()

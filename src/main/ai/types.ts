@@ -2,8 +2,8 @@
  * AI 大模型配置接口
  */
 
-// AI 提供商类型
-export type AIProvider = 'deepseek' | 'openai' | 'claude' | 'custom'
+// AI 提供商类型（支持 DeepSeek、OpenAI、Claude、通义千问、自定义）
+export type AIProvider = 'deepseek' | 'openai' | 'claude' | 'tongyi' | 'custom'
 
 // LLM 配置接口
 export interface LLMConfig {
@@ -17,18 +17,20 @@ export interface LLMConfig {
 
 // 模型信息接口
 export interface ModelInfo {
-  id: string              // 模型 ID
-  name: string            // 模型名称
-  description?: string    // 描述
-  contextWindow?: number  // 上下文窗口大小
-  maxOutput?: number      // 最大输出长度
+  id: string
+  name: string
+  description?: string
+  contextWindow?: number
+  maxOutput?: number
   pricing?: {
-    input: number         // 输入价格（每百万 tokens）
-    output: number        // 输出价格（每百万 tokens）
+    input: number
+    output: number
   }
 }
 
-// AI 分析结果接口
+// ============================
+// 单个启动项 AI 分析结果
+// ============================
 export interface AIAnalysisResult {
   software_name: string
   vendor: string
@@ -41,9 +43,9 @@ export interface AIAnalysisResult {
   necessity_reason: string
   disable_impact: string
   performance_impact: {
-    boot_time_ms: number      // 启动耗时（毫秒）
-    memory_mb: number         // 内存占用（MB）
-    cpu_percent: number       // CPU 占用百分比
+    boot_time_ms: number
+    memory_mb: number
+    cpu_percent: number
   }
   recommendation: 'keep' | 'disable' | 'delay' | 'uninstall'
   recommendation_reason: string
@@ -53,10 +55,53 @@ export interface AIAnalysisResult {
   tags: string[]
 }
 
+// ============================
+// 增强的启动项分析结果（与 System Prompt 对应）
+// ============================
+export interface EnhancedAnalysisResult {
+  item_name: string
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  can_disable: boolean
+  disable_warning?: string
+  reason: string
+  suggestion: string
+  risk_score: number
+}
+
+// ============================
+// 批量分析结果
+// ============================
+export interface BatchAnalysisItem {
+  itemId: string
+  name: string
+  riskLevel: 'low' | 'medium' | 'high' | 'critical'
+  canDisable: boolean
+  disableWarning?: string
+  reason: string
+  suggestion: string
+  riskScore: number
+}
+
+export interface BatchAnalysisResult {
+  items: BatchAnalysisItem[]
+  summary: string
+  totalOptimizable: number
+}
+
+// ============================
+// 分析进度
+// ============================
+export interface AnalyzeProgress {
+  current: number
+  total: number
+  message: string
+  percentage: number
+}
+
 // 安全威胁分析结果
 export interface SecurityAnalysisResult {
   risk_level: 'low' | 'medium' | 'high' | 'critical'
-  risk_score: number          // 0-100
+  risk_score: number
   file_path_risk: string
   behavior_analysis: string
   network_analysis: string
@@ -97,31 +142,36 @@ export interface AIChatResult {
   related_items: Array<{
     id: string
     name: string
-    relevance: number  // 0-1
+    relevance: number
   }>
   suggested_questions: string[]
 }
 
 // 预设提供商配置
-export const PRESET_PROVIDERS: Record<AIProvider, { 
+export const PRESET_PROVIDERS: Record<AIProvider, {
   apiUrl: string
   model: string
-  modelsEndpoint?: string  // 获取模型列表的端点
+  modelsEndpoint?: string
 }> = {
   deepseek: {
-    apiUrl: 'https://api.deepseek.com/v1',  // 统一添加 /v1
+    apiUrl: 'https://api.deepseek.com/v1',
     model: 'deepseek-chat',
     modelsEndpoint: '/models'
   },
   openai: {
     apiUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o',  // 更新为最新模型
+    model: 'gpt-4o',
     modelsEndpoint: '/models'
   },
   claude: {
-    apiUrl: 'https://api.anthropic.com/v1',  // Claude 也使用 /v1
+    apiUrl: 'https://api.anthropic.com/v1',
     model: 'claude-3-opus-20240229',
-    modelsEndpoint: undefined  // Claude API 不支持模型列表
+    modelsEndpoint: undefined
+  },
+  tongyi: {
+    apiUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus',
+    modelsEndpoint: '/models'
   },
   custom: {
     apiUrl: '',

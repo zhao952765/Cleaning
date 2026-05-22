@@ -6,7 +6,7 @@ import { databaseManager } from '../database'
 import { aiClient } from '../ai/client'
 import { aiConfigManager } from '../ai/config'
 import { promptBuilder } from '../ai/prompts'
-import { ScanOptions, SystemInfo } from '../../shared/types'
+import { ScanOptions, SystemInfo, StartupItem } from '../../shared/types'
 import { isAdminPrivilege } from '../index'
 
 /**
@@ -102,45 +102,132 @@ export class IPCHandlers {
       }
     })
 
-    // 完整扫描
+    // 完整扫描（异步队列 + 实时进度回调）
     ipcMain.handle(IPC_CHANNELS.SCAN.ALL, async (_event, options?: Partial<ScanOptions>) => {
       try {
         const startTime = Date.now()
-        
-        // 发送进度通知
-        this.sendProgress(0, 100, '开始扫描...')
-        
+
+        // 连接扫描器进度回调 → 渲染进程
+        startupScanner.setProgressCallback((progress) => {
+          this.sendProgressForScan(progress.current, progress.total, progress.stage, progress.message)
+        })
+
         const items = await startupScanner.scan(options)
-        
+
         const duration = Date.now() - startTime
         this.sendProgress(100, 100, `扫描完成，共 ${items.length} 项`)
-        
+
         // 保存扫描历史
         try {
           databaseManager.saveScanHistory(items.length, duration, { items })
         } catch (e) {
           console.warn('保存扫描历史失败:', e)
         }
-        
+
         return this.success({ items, count: items.length, duration })
       } catch (error: any) {
-        return this.error(error.message)
+        console.error('[IPCHandlers] 全面扫描失败:', error)
+        return this.error(`扫描失败: ${error.message}`)
       }
     })
 
     // ==================== 启动项操作 ====================
-    
+
     // 获取启动项详情
     ipcMain.handle(IPC_CHANNELS.ITEM.GET_DETAIL, async (_event, itemId: string) => {
       try {
-        // TODO: 根据 ID 查找启动项详情
+        // TODO: 根据 ID 在数据库或扫描结果中查找
         return this.success(null)
       } catch (error: any) {
         return this.error(error.message)
       }
     })
 
-    // ==================== AI 相关 ====================
+    // 切换启动项状态（启用/禁用）- 完整实现：备份 + 执行 + 回滚
+    ipcMain.handle(IPC_CHANNELS.ITEM.TOGGLE, async (_event, item: StartupItem, enabled: boolean) => {
+      try {
+        const { systemOperationsManager } = await import('../system/operations')
+
+        // 禁用时检测系统关键项
+        if (!enabled) {
+          const warning = systemOperationsManager.getCriticalWarning(item)
+          if (warning) {
+            return this.success({
+              requireConfirm: true,
+              warning,
+              canProceed: true
+            })
+          }
+        }
+
+        const result = await systemOperationsManager.toggleItem(item, enabled)
+        return this.success({
+          success: result.success,
+          message: result.message,
+          backupPath: result.backupPath,
+          item: { ...item, enabled }
+        })
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
+
+    // 确认禁用关键项（二次确认后实际执行）
+    ipcMain.handle('item:toggle-force', async (_event, item: StartupItem, enabled: boolean) => {
+      try {
+        const { systemOperationsManager } = await import('../system/operations')
+        const result = await systemOperationsManager.toggleItem(item, enabled)
+        return this.success({
+          success: result.success,
+          message: result.message,
+          backupPath: result.backupPath,
+          item: { ...item, enabled }
+        })
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
+
+    // 删除启动项
+    ipcMain.handle(IPC_CHANNELS.ITEM.DELETE, async (_event, item: StartupItem) => {
+      try {
+        const { systemOperationsManager } = await import('../system/operations')
+
+        // 删除系统关键项也需警告
+        const warning = systemOperationsManager.getCriticalWarning(item)
+        if (warning) {
+          return this.success({
+            requireConfirm: true,
+            warning,
+            canProceed: false // 删除关键项默认不允许强制
+          })
+        }
+
+        const result = await systemOperationsManager.deleteItem(item)
+        return this.success({
+          success: result.success,
+          message: result.message,
+          backupPath: result.backupPath
+        })
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
+
+    // 强制删除（绕过关键项保护，仅限明确确认）
+    ipcMain.handle('item:delete-force', async (_event, item: StartupItem) => {
+      try {
+        const { systemOperationsManager } = await import('../system/operations')
+        const result = await systemOperationsManager.deleteItem(item)
+        return this.success({
+          success: result.success,
+          message: result.message,
+          backupPath: result.backupPath
+        })
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
     
     // 测试 AI 连接
     ipcMain.handle(IPC_CHANNELS.AI.TEST_CONNECTION, async () => {
@@ -153,6 +240,38 @@ export class IPCHandlers {
         aiClient.initialize(config)
         const result = await aiClient.testConnection()
         
+        return this.success(result)
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
+
+    // 分析单个启动项（使用 AIService 智能分析）
+    ipcMain.handle('ai:analyze-single', async (_event, item: any) => {
+      try {
+        const config = aiConfigManager.getConfig()
+        if (!config) {
+          return this.error('请先配置 AI 客户端')
+        }
+
+        const { aiService } = await import('../ai/AIService')
+        const result = await aiService.analyzeSingle(item)
+        return this.success(result)
+      } catch (error: any) {
+        return this.error(error.message)
+      }
+    })
+
+    // 批量分析启动项（智能分批 8-10 项）
+    ipcMain.handle('ai:analyze-batch', async (_event, items: any[]) => {
+      try {
+        const config = aiConfigManager.getConfig()
+        if (!config) {
+          return this.error('请先配置 AI 客户端')
+        }
+
+        const { aiService } = await import('../ai/AIService')
+        const result = await aiService.analyzeBatch(items)
         return this.success(result)
       } catch (error: any) {
         return this.error(error.message)
@@ -380,13 +499,19 @@ export class IPCHandlers {
     })
 
     // 切换启动项状态（实际执行）
-    ipcMain.handle(IPC_CHANNELS.ITEM.TOGGLE, async (_event, itemId: string, enabled: boolean) => {
+    ipcMain.handle(IPC_CHANNELS.ITEM.TOGGLE, async (_event, item: StartupItem, enabled: boolean) => {
       try {
-        // TODO: 根据 itemId 查找对应的启动项
-        // 这里需要传入完整的 item 对象，暂时返回成功
-        return this.success({ 
-          message: `已${enabled ? '启用' : '禁用'}启动项`,
-          warning: '系统级操作需要管理员权限，请以管理员身份运行应用'
+        // 检查是否为系统关键项
+        const { systemOperationsManager } = await import('../system/operations')
+        if (!enabled && systemOperationsManager.isSystemCritical(item)) {
+          return this.error('系统关键项，禁止禁用')
+        }
+
+        await systemOperationsManager.toggleItem(item, enabled)
+        
+        return this.success({
+          message: `已${enabled ? '启用' : '禁用'}: ${item.name}`,
+          item: { ...item, enabled }
         })
       } catch (error: any) {
         return this.error(error.message)
@@ -394,7 +519,7 @@ export class IPCHandlers {
     })
 
     // 批量操作
-    ipcMain.handle('item:batch-toggle', async (_event, items: any[], enable: boolean) => {
+    ipcMain.handle(IPC_CHANNELS.ITEM.BATCH_TOGGLE, async (_event, items: any[], enable: boolean) => {
       try {
         const { systemOperationsManager } = await import('../system/operations')
         const result = await systemOperationsManager.batchToggle(items, enable)
@@ -405,7 +530,7 @@ export class IPCHandlers {
     })
 
     // 还原所有修改
-    ipcMain.handle('item:restore-all', async () => {
+    ipcMain.handle(IPC_CHANNELS.ITEM.RESTORE_ALL, async () => {
       try {
         const { systemOperationsManager } = await import('../system/operations')
         const result = await systemOperationsManager.restoreAll()
@@ -416,7 +541,7 @@ export class IPCHandlers {
     })
 
     // 检查是否为系统关键项
-    ipcMain.handle('item:is-critical', async (_event, item: any) => {
+    ipcMain.handle(IPC_CHANNELS.ITEM.IS_CRITICAL, async (_event, item: any) => {
       try {
         const { systemOperationsManager } = await import('../system/operations')
         const isCritical = systemOperationsManager.isSystemCritical(item)
@@ -426,10 +551,10 @@ export class IPCHandlers {
       }
     })
 
-    // ==================== 性能优化相关 ====================
-    
+    // ==================== 缓存管理 ====================
+
     // 清除扫描缓存
-    ipcMain.handle('cache:clear-scan', async () => {
+    ipcMain.handle(IPC_CHANNELS.CACHE.CLEAR_SCAN, async () => {
       try {
         const { scanCache } = await import('../system/performance')
         scanCache.clear()
@@ -440,7 +565,7 @@ export class IPCHandlers {
     })
 
     // 清除 AI 缓存
-    ipcMain.handle('cache:clear-ai', async () => {
+    ipcMain.handle(IPC_CHANNELS.CACHE.CLEAR_AI, async () => {
       try {
         const { aiCache } = await import('../system/performance')
         aiCache.clear()
@@ -451,7 +576,7 @@ export class IPCHandlers {
     })
 
     // 获取缓存统计
-    ipcMain.handle('cache:get-stats', async () => {
+    ipcMain.handle(IPC_CHANNELS.CACHE.GET_STATS, async () => {
       try {
         const { aiCache } = await import('../system/performance')
         const stats = aiCache.getStats()
@@ -462,7 +587,7 @@ export class IPCHandlers {
     })
 
     // 获取内存使用情况
-    ipcMain.handle('system:get-memory', async () => {
+    ipcMain.handle(IPC_CHANNELS.SYSTEM.GET_MEMORY, async () => {
       try {
         const { memoryMonitor } = await import('../system/performance')
         const memory = memoryMonitor.getMainProcessMemory()
@@ -501,21 +626,21 @@ export class IPCHandlers {
   }
 
   /**
-   * 发送进度通知
+   * 发送进度通知（兼容旧格式）
    */
   private sendProgress(current: number, total: number, message: string): void {
     if (!this.mainWindow || !this.mainWindow.webContents) return
-
     const percentage = total > 0 ? Math.round((current / total) * 100) : 0
-    
-    const notification: ProgressNotification = {
-      current,
-      total,
-      message,
-      percentage
-    }
+    this.mainWindow.webContents.send(IPC_CHANNELS.SCAN.PROGRESS, { current, total, message, percentage })
+  }
 
-    this.mainWindow.webContents.send('scan:progress', notification)
+  /**
+   * 发送扫描进度通知（增强版，含 stage 字段）
+   */
+  private sendProgressForScan(current: number, total: number, stage: string, message: string): void {
+    if (!this.mainWindow || !this.mainWindow.webContents) return
+    const percentage = total > 0 ? Math.round((current / total) * 100) : 0
+    this.mainWindow.webContents.send(IPC_CHANNELS.SCAN.PROGRESS, { current, total, stage, message, percentage })
   }
 
   /**
@@ -523,23 +648,14 @@ export class IPCHandlers {
    */
   dispose(): void {
     // 移除所有 IPC 监听器
-    Object.values(IPC_CHANNELS.SCAN).forEach(channel => {
-      ipcMain.removeHandler(channel)
-    })
-    Object.values(IPC_CHANNELS.AI).forEach(channel => {
-      ipcMain.removeHandler(channel)
-    })
-    Object.values(IPC_CHANNELS.DB).forEach(channel => {
-      ipcMain.removeHandler(channel)
-    })
-    Object.values(IPC_CHANNELS.FILE).forEach(channel => {
-      ipcMain.removeHandler(channel)
-    })
-    Object.values(IPC_CHANNELS.ITEM).forEach(channel => {
-      ipcMain.removeHandler(channel)
-    })
-    Object.values(IPC_CHANNELS.SYSTEM).forEach(channel => {
-      ipcMain.removeHandler(channel)
+    Object.entries(IPC_CHANNELS).forEach(([, category]) => {
+      if (typeof category === 'object' && category !== null) {
+        Object.values(category).forEach(channel => {
+          if (typeof channel === 'string') {
+            ipcMain.removeHandler(channel)
+          }
+        })
+      }
     })
     
     console.log('[IPCHandlers] IPC 处理器已清理')

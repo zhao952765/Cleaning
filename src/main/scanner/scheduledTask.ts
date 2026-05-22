@@ -1,31 +1,31 @@
 import { exec } from 'child_process'
 import { promisify } from 'util'
+import crypto from 'crypto'
 import { StartupItem, StartupType, StartupStatus, SecurityLevel } from '../../shared/types'
+import { fileInfoExtractor } from './fileInfo'
 
 const execAsync = promisify(exec)
 
 /**
- * 计划任务启动项扫描器（增强版）
- * 使用 PowerShell 获取更详细的任务信息
+ * 计划任务扫描器
+ * 使用 PowerShell Get-ScheduledTask 获取 Ready 状态的任务
+ * 提取 TaskName、Action、Trigger、Author 信息
  */
 export class ScheduledTaskScanner {
-  /**
-   * 扫描所有计划任务
-   */
   async scan(): Promise<StartupItem[]> {
     const items: StartupItem[] = []
 
     try {
-      // 使用 PowerShell 获取详细信息
       const tasks = await this.getTasksWithPowerShell()
-      
       for (const task of tasks) {
-        if (this.isStartupTask(task)) {
+        if (this.isValidTask(task)) {
           items.push(this.createTaskItem(task))
         }
       }
 
-      console.log(`[ScheduledTaskScanner] 扫描完成，共找到 ${items.length} 个计划任务启动项`)
+      this.enrichWithFileInfo(items)
+
+      console.log(`[ScheduledTaskScanner] 扫描完成，共 ${items.length} 个计划任务`)
     } catch (error) {
       console.error('[ScheduledTaskScanner] 扫描失败:', error)
     }
@@ -33,171 +33,152 @@ export class ScheduledTaskScanner {
     return items
   }
 
-  /**
-   * 使用 PowerShell 获取计划任务详情
-   */
   private async getTasksWithPowerShell(): Promise<any[]> {
     try {
+      // 只获取 Ready 状态（已启用就绪）的任务，提取 TaskName/Action/Trigger/Author
       const psScript = `
-        Get-ScheduledTask | 
-        Where-Object { $_.State -eq 'Ready' -or $_.State -eq 'Running' } |
-        ForEach-Object {
-          $triggers = ($_ | Get-ScheduledTaskInfo).NumberOfMissedRuns
-          $actions = $_.Actions.Execute
-          [PSCustomObject]@{
-            TaskName = $_.TaskName
-            State = $_.State
-            Description = $_.Description
-            Actions = ($actions -join '; ')
-            Enabled = $_.State -eq 'Ready'
-            LastRunTime = ($_. | Get-ScheduledTaskInfo).LastRunTime
-            NextRunTime = ($_. | Get-ScheduledTaskInfo).NextRunTime
+        $tasks = Get-ScheduledTask | Where-Object { $_.State -eq 'Ready' -and $_.Actions.Count -gt 0 };
+        $result = @();
+        foreach ($task in $tasks) {
+          $taskInfo = $task | Get-ScheduledTaskInfo;
+          $triggerTypes = @();
+          foreach ($trigger in $task.Triggers) {
+            $triggerTypes += @{
+              Type = $trigger.CimClass.CimClassName
+              Enabled = $trigger.Enabled
+              StartBoundary = $trigger.StartBoundary
+              Repetition = $trigger.Repetition.Interval
+            }
           }
-        } | ConvertTo-Json -Depth 3
+          $actions = @();
+          foreach ($action in $task.Actions) {
+            $actions += @{
+              Execute = $action.Execute
+              Arguments = $action.Arguments
+              WorkingDirectory = $action.WorkingDirectory
+            }
+          }
+          $result += [PSCustomObject]@{
+            TaskName = $task.TaskName
+            TaskPath = $task.TaskPath
+            State = $task.State.ToString()
+            Description = $task.Description
+            Author = $task.Author
+            Triggers = ($triggerTypes | ConvertTo-Json -Compress)
+            Actions = ($actions | ConvertTo-Json -Compress)
+            Enabled = $task.Enabled
+            LastRunTime = $taskInfo.LastRunTime
+            NextRunTime = $taskInfo.NextRunTime
+            NumberOfMissedRuns = $taskInfo.NumberOfMissedRuns
+          }
+        }
+        ConvertTo-Json $result -Depth 5 -Compress
       `
-      
-      const { stdout } = await execAsync(`powershell -Command "${psScript}"`, {
+
+      const { stdout } = await execAsync(`powershell -NoProfile -Command "${psScript}"`, {
         encoding: 'utf8',
-        maxBuffer: 10 * 1024 * 1024
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 60000,
+        windowsHide: true,
       })
 
-      if (!stdout || stdout.trim().length === 0) {
-        return []
-      }
+      if (!stdout || stdout.trim().length === 0) return []
 
       const parsed = JSON.parse(stdout)
-      return Array.isArray(parsed) ? parsed : [parsed]
+      return Array.isArray(parsed) ? parsed : parsed ? [parsed] : []
     } catch (error) {
-      console.warn('[ScheduledTaskScanner] PowerShell 执行失败，回退到 schtasks:', error)
-      return this.getTasksWithSchTasks()
-    }
-  }
-
-  /**
-   * 回退方案：使用 schtasks 命令
-   */
-  private async getTasksWithSchTasks(): Promise<any[]> {
-    try {
-      const { stdout } = await execAsync('schtasks /query /fo csv /nh /v', {
-        encoding: 'utf8',
-        maxBuffer: 10 * 1024 * 1024
-      })
-
-      const tasks: any[] = []
-      const lines = stdout.split('\n').filter(line => line.trim())
-
-      for (const line of lines) {
-        if (line.startsWith('"TaskName"')) continue
-        
-        const fields = this.parseCsvLine(line)
-        if (fields.length >= 8) {
-          tasks.push({
-            TaskName: fields[0]?.replace(/^"|"$/g, ''),
-            State: fields[1]?.replace(/^"|"$/g, ''),
-            Description: fields[2]?.replace(/^"|"$/g, ''),
-            Actions: fields[7]?.replace(/^"|"$/g, ''),
-            Enabled: fields[1]?.includes('Ready'),
-            LastRunTime: fields[3]?.replace(/^"|"$/g, ''),
-            NextRunTime: fields[4]?.replace(/^"|"$/g, '')
-          })
-        }
-      }
-
-      return tasks
-    } catch (error) {
-      console.error('[ScheduledTaskScanner] schtasks 执行失败:', error)
+      console.error('[ScheduledTaskScanner] PowerShell 执行失败:', error)
       return []
     }
   }
 
-  /**
-   * 解析 CSV 行
-   */
-  private parseCsvLine(line: string): string[] {
-    const fields: string[] = []
-    let current = ''
-    let inQuotes = false
+  private isValidTask(task: any): boolean {
+    // 排除系统维护类空任务，保留有实际可执行动作的任务
+    if (!task.Actions) return false
 
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i]
-
-      if (char === '"') {
-        inQuotes = !inQuotes
-      } else if (char === ',' && !inQuotes) {
-        fields.push(current.trim())
-        current = ''
-      } else {
-        current += char
-      }
+    try {
+      const actions = typeof task.Actions === 'string' ? JSON.parse(task.Actions) : task.Actions
+      return Array.isArray(actions) && actions.length > 0 && actions[0].Execute
+    } catch {
+      return false
     }
-
-    if (current) {
-      fields.push(current.trim())
-    }
-
-    return fields
   }
 
-  /**
-   * 判断是否为启动相关任务
-   */
-  private isStartupTask(task: any): boolean {
-    // 检查任务状态
-    const isReady = task.State === 'Ready' || task.State === 'Running'
-    
-    // 检查描述或名称是否包含启动相关关键词
-    const startupKeywords = ['boot', 'start', 'startup', 'login', 'logon', 'system']
-    const hasKeyword = startupKeywords.some(keyword => 
-      (task.TaskName && task.TaskName.toLowerCase().includes(keyword)) ||
-      (task.Description && task.Description.toLowerCase().includes(keyword))
-    )
-
-    return isReady && (hasKeyword || true) // 暂时返回所有就绪任务
-  }
-
-  /**
-   * 创建任务启动项对象
-   */
   private createTaskItem(task: any): StartupItem {
     const taskName = task.TaskName || 'Unknown Task'
-    const description = task.Description || undefined
-    
+    const fullTaskPath = (task.TaskPath || '\\') + taskName
+
+    // 解析动作
+    let executablePath = ''
+    let args = ''
+    try {
+      const actions = typeof task.Actions === 'string' ? JSON.parse(task.Actions) : task.Actions
+      if (Array.isArray(actions) && actions.length > 0) {
+        executablePath = actions[0].Execute || ''
+        args = actions[0].Arguments || ''
+      }
+    } catch {
+      executablePath = ''
+    }
+
+    if (!executablePath) {
+      executablePath = 'Task Scheduler'
+    }
+
+    // 解析触发器摘要
+    let triggerSummary = ''
+    try {
+      const triggers = typeof task.Triggers === 'string' ? JSON.parse(task.Triggers) : task.Triggers
+      if (Array.isArray(triggers)) {
+        triggerSummary = triggers
+          .map((t: any) => t.Type?.replace('MSFT_Task', '') || 'Unknown')
+          .join('; ')
+      }
+    } catch {
+      triggerSummary = ''
+    }
+
+    const isSystem = (task.TaskPath || '').startsWith('\\Microsoft\\Windows\\')
+
     return {
-      id: `task_${this.generateId(taskName)}`,
+      id: `task_${this.hashString(fullTaskPath)}`,
       name: taskName,
-      description,
+      description: task.Description || `计划任务 (${triggerSummary || '未指定触发器'})`,
       type: StartupType.ScheduledTask,
       source: 'task',
       status: task.Enabled ? StartupStatus.Enabled : StartupStatus.Disabled,
-      path: task.Actions || 'Task Scheduler',
-      arguments: undefined,
-      publisher: undefined,
+      path: executablePath,
+      arguments: args || undefined,
+      publisher: task.Author || undefined,
       version: undefined,
       securityLevel: SecurityLevel.Safe,
       impact: 'medium',
-      enabled: task.Enabled,
-      lastModified: task.LastRunTime ? new Date(task.LastRunTime) : undefined,
-      icon: undefined,
-      iconColor: undefined,
-      banRateValue: undefined
+      enabled: task.Enabled !== false,
+      isSystem,
+      location: fullTaskPath,
+      hash: executablePath ? this.hashString(executablePath.toLowerCase()) : undefined,
     }
   }
 
-  /**
-   * 生成唯一 ID
-   */
-  private generateId(taskName: string): string {
-    let hash = 0
-    for (let i = 0; i < taskName.length; i++) {
-      const char = taskName.charCodeAt(i)
-      hash = ((hash << 5) - hash) + char
-      hash = hash & hash
+  private enrichWithFileInfo(items: StartupItem[]): void {
+    for (const item of items) {
+      const realPath = item.path && item.path !== 'Task Scheduler' ? item.path : null
+      if (realPath) {
+        fileInfoExtractor.getFileInfo(realPath).then(info => {
+          if (info) {
+            item.fileInfo = info
+            if (info.version) item.version = info.version
+            if (info.company) item.publisher = info.company
+            if (info.description && !item.description) item.description = info.description
+          }
+        }).catch(() => {})
+      }
     }
-    return Math.abs(hash).toString(16)
+  }
+
+  private hashString(input: string): string {
+    return crypto.createHash('md5').update(input).digest('hex').substring(0, 16)
   }
 }
 
-/**
- * 导出单例实例
- */
 export const scheduledTaskScanner = new ScheduledTaskScanner()

@@ -65,7 +65,7 @@ export class AIConfigManager {
   /**
    * 使用预设提供商配置
    */
-  usePresetProvider(provider: 'deepseek' | 'openai' | 'claude', apiKey: string): LLMConfig {
+  usePresetProvider(provider: 'deepseek' | 'openai' | 'claude' | 'tongyi', apiKey: string): LLMConfig {
     const preset = PRESET_PROVIDERS[provider]
     
     const config: LLMConfig = {

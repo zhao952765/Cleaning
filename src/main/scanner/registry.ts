@@ -1,50 +1,57 @@
 import Winreg from 'winreg'
-import path from 'path'
-import { StartupItem } from '../../shared/types'
+import crypto from 'crypto'
+import { StartupItem, StartupType, StartupStatus, SecurityLevel } from '../../shared/types'
+import { fileInfoExtractor } from './fileInfo'
 
 /**
  * 注册表启动项扫描器
- * 扫描 Windows 注册表中的启动项配置
+ * 扫描 HKCU/HKLM 下 Run、RunOnce、RunServices、Policies、Winlogon 等路径
  */
 export class RegistryScanner {
-  // 需要扫描的注册表路径（静态常量）
-  private static readonly REGISTRY_PATHS = [
-    {
-      hive: Winreg.HKLM,
-      key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run',
-      name: 'HKLM - CurrentVersion Run'
-    },
-    {
-      hive: Winreg.HKLM,
-      key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run',
-      name: 'HKLM - WOW6432Node Run'
-    },
-    {
-      hive: Winreg.HKCU,
-      key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run',
-      name: 'HKCU - CurrentVersion Run'
-    }
+  // 完整的注册表路径列表（按来源分组注释）
+  private static readonly REGISTRY_PATHS: Array<{
+    hive: string
+    key: string
+    name: string
+    isSystem: boolean
+    enabled: boolean
+  }> = [
+    // ========== HKCU - 当前用户 ==========
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKCU-Run', isSystem: false, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKCU-RunOnce', isSystem: false, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKCU-RunServices', isSystem: false, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run-', name: 'HKCU-Run-Disabled', isSystem: false, enabled: false },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run', name: 'HKCU-Policies', isSystem: false, enabled: true },
+
+    // ========== HKLM - 所有用户 ==========
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKLM-Run', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKLM-RunOnce', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKLM-RunServices', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run-', name: 'HKLM-Run-Disabled', isSystem: true, enabled: false },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run', name: 'HKLM-Policies', isSystem: true, enabled: true },
+
+    // ========== HKLM Wow6432Node - 32 位兼容 ==========
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run', name: 'HKLM-WOW64-Run', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce', name: 'HKLM-WOW64-RunOnce', isSystem: true, enabled: true },
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunServices', name: 'HKLM-WOW64-RunServices', isSystem: true, enabled: true },
+
+    // ========== Winlogon - 系统登录相关 ==========
+    { hive: Winreg.HKLM, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKLM-Winlogon', isSystem: true, enabled: true },
+    { hive: Winreg.HKCU, key: '\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon', name: 'HKCU-Winlogon', isSystem: false, enabled: true },
   ]
 
-  /**
-   * 扫描所有注册表启动项
-   */
   async scan(): Promise<StartupItem[]> {
     const items: StartupItem[] = []
 
     try {
-      // 并行扫描所有注册表路径
-      const promises = RegistryScanner.REGISTRY_PATHS.map((regPath: {
-        hive: string
-        key: string
-        name: string
-      }) => this.scanRegistryPath(regPath))
+      const promises = RegistryScanner.REGISTRY_PATHS.map(p => this.scanRegistryPath(p))
       const results = await Promise.all(promises)
+      results.forEach(r => items.push(...r))
 
-      // 合并结果
-      results.forEach((result: StartupItem[]) => items.push(...result))
+      // 异步填充 fileInfo（不阻塞主扫描流程）
+      this.enrichWithFileInfo(items)
 
-      console.log(`[RegistryScanner] 扫描完成，共找到 ${items.length} 个启动项`)
+      console.log(`[RegistryScanner] 扫描完成，共 ${items.length} 个注册表启动项`)
     } catch (error) {
       console.error('[RegistryScanner] 扫描失败:', error)
     }
@@ -52,174 +59,143 @@ export class RegistryScanner {
     return items
   }
 
-  /**
-   * 扫描单个注册表路径
-   */
   private async scanRegistryPath(regPath: {
-    hive: string
-    key: string
-    name: string
+    hive: string; key: string; name: string; isSystem: boolean; enabled: boolean
   }): Promise<StartupItem[]> {
     const items: StartupItem[] = []
 
     return new Promise((resolve) => {
-      const registry = new Winreg({
-        hive: regPath.hive,
-        key: regPath.key
-      })
+      const registry = new Winreg({ hive: regPath.hive, key: regPath.key })
 
-      registry.values((err, values) => {
-        if (err) {
-          console.warn(`[RegistryScanner] 读取注册表失败 [${regPath.name}]:`, err.message)
-          resolve([])
-          return
-        }
+      registry.keyExists((err, exists) => {
+        if (err || !exists) { resolve([]); return }
 
-        if (!values || values.length === 0) {
-          resolve([])
-          return
-        }
-
-        values.forEach(value => {
-          try {
-            const item = this.parseRegistryValue(value, regPath)
-            if (item) {
-              items.push(item)
-            }
-          } catch (parseError) {
-            console.warn(`[RegistryScanner] 解析注册表值失败:`, parseError)
+        registry.values((err, values) => {
+          if (err || !values || values.length === 0) {
+            if (err) console.warn(`[RegistryScanner] 读取失败 [${regPath.name}]:`, err.message)
+            resolve([]); return
           }
-        })
 
-        resolve(items)
+          for (const value of values) {
+            try {
+              // 跳过 PowerShell 内部属性
+              if (['PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider'].includes(value.name)) continue
+
+              // Winlogon 只保留 Shell / Userinit / Taskman / System
+              if (regPath.key.includes('Winlogon')) {
+                if (!['Shell', 'Userinit', 'Taskman', 'System'].includes(value.name)) continue
+              }
+
+              if (!value.value || value.value.trim().length === 0) continue
+
+              const item = this.parseRegistryValue(value, regPath)
+              if (item) items.push(item)
+            } catch (parseError) {
+              console.warn(`[RegistryScanner] 解析值失败:`, parseError)
+            }
+          }
+
+          resolve(items)
+        })
       })
     })
   }
 
   /**
-   * 解析注册表值
+   * 解析注册表值 → StartupItem
+   * 正确处理带引号路径、空格、参数
+   * 例如 "C:\Program Files\xx.exe" -silent → path="C:\Program Files\xx.exe", args="-silent"
    */
   private parseRegistryValue(
     value: Winreg.RegistryItem,
-    regPath: { hive: string; key: string; name: string }
+    regPath: { hive: string; key: string; name: string; isSystem: boolean; enabled: boolean }
   ): StartupItem | null {
-    if (!value.value || value.value.trim().length === 0) {
-      return null
-    }
-
-    // 解析命令行字符串，分离路径和参数
     const { executablePath, args } = this.parseCommandLine(value.value)
+    if (!executablePath) return null
 
-    // 生成唯一 ID
-    const id = this.generateId(regPath.key, value.name)
-
-    // 检查是否为有效的可执行文件路径
-    if (!this.isValidExecutablePath(executablePath)) {
-      return null
-    }
+    const hiveName = regPath.hive === Winreg.HKLM ? 'HKLM' : 'HKCU'
+    const location = `${hiveName}${regPath.key}\\${value.name}`
 
     return {
-      id,
+      id: `registry_${this.hashString(location)}`,
       name: value.name,
       description: undefined,
-      type: 'registry' as any,
-      status: 'enabled' as any,
+      type: StartupType.Registry,
+      source: 'registry',
+      status: regPath.enabled ? StartupStatus.Enabled : StartupStatus.Disabled,
       path: executablePath,
-      arguments: args,
+      arguments: args || undefined,
       publisher: undefined,
       version: undefined,
-      securityLevel: 'safe' as any,
+      securityLevel: SecurityLevel.Safe,
       impact: 'medium',
-      enabled: true,
+      enabled: regPath.enabled,
+      location,
+      isSystem: regPath.isSystem,
+      hash: executablePath ? this.hashString(executablePath.toLowerCase()) : undefined,
       lastModified: undefined,
-      icon: undefined,
-      iconColor: undefined,
-      banRateValue: undefined
     }
   }
 
   /**
-   * 解析命令行字符串，分离可执行文件路径和参数
-   * 处理以下情况：
-   * - "C:\Program Files\App\app.exe" --arg1 --arg2
-   * - C:\Windows\System32\notepad.exe
-   * - "C:\Program Files\App\launcher.exe" /start "C:\Games\game.exe"
+   * 解析命令行字符串，正确处理三种情况：
+   * 1. "C:\Program Files\xx.exe" -silent
+   * 2. C:\tools\xx.exe --flag
+   * 3. C:\simple.exe
    */
-  private parseCommandLine(commandLine: string): {
-    executablePath: string
-    args: string
-  } {
+  private parseCommandLine(commandLine: string): { executablePath: string; args: string } {
     const trimmed = commandLine.trim()
+    if (!trimmed) return { executablePath: '', args: '' }
 
-    // 情况1: 路径被引号包裹
+    // 情况1：被引号包裹
     if (trimmed.startsWith('"')) {
-      const endQuoteIndex = trimmed.indexOf('"', 1)
-      if (endQuoteIndex !== -1) {
-        const executablePath = trimmed.substring(1, endQuoteIndex)
-        const args = trimmed.substring(endQuoteIndex + 1).trim()
-        return { executablePath, args }
+      const end = trimmed.indexOf('"', 1)
+      if (end !== -1) {
+        return {
+          executablePath: trimmed.substring(1, end),
+          args: trimmed.substring(end + 1).trim(),
+        }
       }
     }
 
-    // 情况2: 路径未被引号包裹，需要找到第一个空格分割
-    const spaceIndex = trimmed.indexOf(' ')
-    if (spaceIndex !== -1) {
-      const executablePath = trimmed.substring(0, spaceIndex)
-      const args = trimmed.substring(spaceIndex + 1).trim()
-      return { executablePath, args }
+    // 情况2：未被引号包裹，查找第一个空格分割路径和参数
+    const spaceIdx = trimmed.indexOf(' ')
+    if (spaceIdx !== -1) {
+      // 检查第一个空格前是否为有效路径扩展名
+      const potentialPath = trimmed.substring(0, spaceIdx)
+      if (/\.(exe|com|bat|cmd|vbs|ps1|js|dll)$/i.test(potentialPath)) {
+        return {
+          executablePath: potentialPath,
+          args: trimmed.substring(spaceIdx + 1).trim(),
+        }
+      }
     }
 
-    // 情况3: 整个字符串就是路径，没有参数
+    // 情况3：整个字符串就是路径
     return { executablePath: trimmed, args: '' }
   }
 
   /**
-   * 验证是否为有效的可执行文件路径
+   * 异步填充 fileInfo（不阻塞扫描）
    */
-  private isValidExecutablePath(pathStr: string): boolean {
-    if (!pathStr || pathStr.trim().length === 0) {
-      return false
+  private enrichWithFileInfo(items: StartupItem[]): void {
+    for (const item of items) {
+      if (item.path) {
+        fileInfoExtractor.getFileInfo(item.path).then(info => {
+          if (info) {
+            item.fileInfo = info
+            if (info.version) item.version = info.version
+            if (info.company) item.publisher = info.company
+            if (info.description) item.description = info.description
+          }
+        }).catch(() => { /* 静默失败 */ })
+      }
     }
-
-    // 检查是否包含常见的可执行文件扩展名
-    const validExtensions = ['.exe', '.bat', '.cmd', '.com', '.vbs', '.js', '.msi']
-    const lowerPath = pathStr.toLowerCase()
-
-    return validExtensions.some(ext => lowerPath.endsWith(ext))
   }
 
-  /**
-   * 生成唯一 ID
-   */
-  private generateId(registryKey: string, itemName: string): string {
-    const combined = `${registryKey}|${itemName}`
-    // 使用简单的哈希算法生成唯一 ID
-    let hash = 0
-    for (let i = 0; i < combined.length; i++) {
-      const char = combined.charCodeAt(i)
-      hash = ((hash << 5) - hash) + char
-      hash = hash & hash // Convert to 32bit integer
-    }
-    return `registry_${Math.abs(hash).toString(16)}`
-  }
-
-  /**
-   * 获取注册表位置的可读名称
-   */
-  private getRegistryLocationName(hive: string, key: string): string {
-    const hiveNames: Record<string, string> = {
-      [Winreg.HKLM]: 'HKEY_LOCAL_MACHINE',
-      [Winreg.HKCU]: 'HKEY_CURRENT_USER',
-      [Winreg.HKCR]: 'HKEY_CLASSES_ROOT',
-      [Winreg.HKU]: 'HKEY_USERS'
-    }
-
-    const hiveName = hiveNames[hive] || hive
-    return `${hiveName}${key}`
+  private hashString(input: string): string {
+    return crypto.createHash('md5').update(input).digest('hex').substring(0, 16)
   }
 }
 
-/**
- * 导出单例实例
- */
 export const registryScanner = new RegistryScanner()
